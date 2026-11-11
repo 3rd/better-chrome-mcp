@@ -1,0 +1,1 @@
+# Deliberately empty. Child Bun processes load this file instead of a bunfig.toml in the user's workspace.

@@ -1,0 +1,47 @@
+diff --git a/front_end/models/ai_assistance/data_formatters/PerformanceTraceFormatter.ts b/front_end/models/ai_assistance/data_formatters/PerformanceTraceFormatter.ts
+--- a/front_end/models/ai_assistance/data_formatters/PerformanceTraceFormatter.ts
++++ b/front_end/models/ai_assistance/data_formatters/PerformanceTraceFormatter.ts
+@@ -633,7 +633,7 @@ export class PerformanceTraceFormatter {
+       return requests.map(request => this.#networkRequestVerbosely(request, options)).join('\n');
+     }
+ 
+-    return this.#networkRequestsArrayCompressed(requests);
++    return PerformanceTraceFormatter.networkDataFormatDescription + '\n\n' + this.#networkRequestsArrayCompressed(requests);
+   }
+ 
+   #getOrAssignUrlIndex(urlIdToIndex: Map<string, number>, url: string): number {
+@@ -822,16 +822,17 @@ export class PerformanceTraceFormatter {
+    * Network requests format description that is sent to the model as a fact.
+    */
+   static networkDataFormatDescription = `Network requests are formatted like this:
+-\`urlIndex;eventKey;queuedTime;requestSentTime;downloadCompleteTime;processingCompleteTime;totalDuration;downloadDuration;mainThreadProcessingDuration;statusCode;mimeType;priority;initialPriority;finalPriority;renderBlocking;protocol;fromServiceWorker;initiators;redirects:[[redirectUrlIndex|startTime|duration]];responseHeaders:[header1Value|header2Value|...]\`
++\`urlIndex;eventKey;queuedTime;requestSentTime;downloadCompleteTime;processingCompleteTime;totalDuration;downloadDuration;mainThreadProcessingDuration;statusCode;mimeType;priority;initialPriority;finalPriority;renderBlocking;protocol;fromServiceWorker;initiators;redirects;responseHeaders\`
+ 
+-- \`urlIndex\`: Numerical index for the request's URL, referencing the "All URLs" list.
++- \`urlIndex\`: Numerical index for the request's URL in the \`allUrls\` map.
+ - \`eventKey\`: String that uniquely identifies this request's trace event.
+-Timings (all in milliseconds, relative to navigation start):
++Timings and durations include their unit: microseconds (µs) below 100 microseconds, milliseconds (ms) otherwise.
++Timings are relative to navigation start, or trace start when no navigation is available:
+ - \`queuedTime\`: When the request was queued.
+ - \`requestSentTime\`: When the request was sent.
+ - \`downloadCompleteTime\`: When the download completed.
+ - \`processingCompleteTime\`: When main thread processing finished.
+-Durations (all in milliseconds):
++Durations:
+ - \`totalDuration\`: Total time from the request being queued until its main thread processing completed.
+ - \`downloadDuration\`: Time spent actively downloading the resource.
+ - \`mainThreadProcessingDuration\`: Time spent on the main thread after the download completed.
+@@ -845,9 +846,9 @@ Durations (all in milliseconds):
+ - \`fromServiceWorker\`: 't' if the request was served from a service worker, 'f' otherwise.
+ - \`initiators\`: A list (separated by ,) of URL indices for the initiator chain of this request. Listed in order starting from the root request to the request that directly loaded this one. This represents the network dependencies necessary to load this request. If there is no initiator, this is empty.
+ - \`redirects\`: A comma-separated list of redirects, enclosed in square brackets. Each redirect is formatted as
+-\`[redirectUrlIndex|startTime|duration]\`, where: \`redirectUrlIndex\`: Numerical index for the redirect's URL. \`startTime\`: The start time of the redirect in milliseconds, relative to navigation start. \`duration\`: The duration of the redirect in milliseconds.
+-- \`responseHeaders\`: A list (separated by '|') of values for specific, pre-defined response headers, enclosed in square brackets.
+-The order of headers corresponds to an internal fixed list. If a header is not present, its value will be empty.
++\`[redirectUrlIndex|startTime|duration]\`, where: \`redirectUrlIndex\`: Numerical index for the redirect's URL in \`allUrls\`. \`startTime\`: The redirect's start time relative to the same base as request timings. \`duration\`: The redirect's duration. Both include their unit as described above. No redirects is \`[]\`.
++- \`responseHeaders\`: Named entries formatted as \`[headerName: headerValue|...]\`, in response order.
++Values of headers outside the allow-list are \`<redacted>\`. Absent headers have no entry; no headers is \`[]\`.
+ `;
+ 
+   /**

@@ -1,0 +1,1307 @@
+diff --git a/dist/FastMCP.d.cts b/dist/FastMCP.d.cts
+index 52db12c2be116c190846757eb94178184bb9bb5e..d89e9177ad4f960e9f99f744ac61441e01b754d4 100644
+--- a/dist/FastMCP.d.cts
++++ b/dist/FastMCP.d.cts
+@@ -2,7 +2,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+ import { EventStore } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+ import { RequestOptions } from '@modelcontextprotocol/sdk/shared/protocol.js';
+ import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
+-import { ResourceLink, ElicitRequestFormParams, ElicitRequestURLParams, ElicitResult, Root, ClientCapabilities, Icon, GetPromptResult, CreateMessageRequestSchema } from '@modelcontextprotocol/sdk/types.js';
++import { ResourceLink, TextContent as McpTextContent, ImageContent as McpImageContent, AudioContent as McpAudioContent, EmbeddedResource, CallToolResult, Tool as McpTool, ElicitRequestFormParams, ElicitRequestURLParams, ElicitResult, Root, ClientCapabilities, Icon, GetPromptResult, CreateMessageRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+ export { Icon, ResourceLink } from '@modelcontextprotocol/sdk/types.js';
+ import { StandardSchemaV1 } from '@standard-schema/spec';
+ import { EventEmitter } from 'events';
+@@ -239,10 +239,7 @@ type Progress = {
+ type SerializableValue = {
+     [key: string]: SerializableValue;
+ } | Literal | SerializableValue[];
+-type TextContent = {
+-    text: string;
+-    type: "text";
+-};
++type TextContent = McpTextContent;
+ type ToolParameters = StandardSchemaV1;
+ declare abstract class FastMCPError extends Error {
+     constructor(message?: string);
+@@ -269,32 +266,11 @@ declare class UnexpectedStateError extends FastMCPError {
+  */
+ declare class UserError extends UnexpectedStateError {
+ }
+-type ImageContent = {
+-    data: string;
+-    mimeType: string;
+-    type: "image";
+-};
+-type AudioContent = {
+-    data: string;
+-    mimeType: string;
+-    type: "audio";
+-};
+-type ResourceContent = {
+-    resource: {
+-        blob?: string;
+-        mimeType?: string;
+-        text?: string;
+-        uri: string;
+-    };
+-    type: "resource";
+-};
+-type Content = AudioContent | ImageContent | ResourceContent | ResourceLink | TextContent;
+-type ContentResult = {
+-    _meta?: Record<string, unknown>;
+-    content: Content[];
+-    isError?: boolean;
+-    structuredContent?: Record<string, unknown>;
+-};
++type ImageContent = McpImageContent;
++type AudioContent = McpAudioContent;
++type ResourceContent = EmbeddedResource;
++type Content = CallToolResult["content"][number];
++type ContentResult = CallToolResult;
+ type Completion = {
+     hasMore?: boolean;
+     total?: number;
+@@ -468,6 +444,11 @@ type ServerOptions<T extends FastMCPSessionAuth> = {
+      */
+     logger?: Logger;
+     name: string;
++    resourcesCapabilities?: {
++        listChanged?: boolean;
++        subscribe?: boolean;
++    };
++    sessionResourceProvider?: (auth?: FastMCPSessionAuth, context?: LoadContext<FastMCPSessionAuth>) => Promise<readonly Resource<FastMCPSessionAuth>[]>;
+     /**
+      * Configuration for OAuth well-known discovery endpoints that can be exposed
+      * when the server is running using HTTP-based transports (SSE or HTTP Stream).
+@@ -674,6 +655,7 @@ type ServerOptions<T extends FastMCPSessionAuth> = {
+         arguments: Record<string, unknown>;
+         toolName: string;
+     }) => Promise<void> | void;
++    onTransportStart?: (transport: Transport) => void;
+     ping?: {
+         /**
+          * Whether ping should be enabled by default.
+@@ -778,11 +760,14 @@ type Tool<T extends FastMCPSessionAuth, Params extends ToolParameters = ToolPara
+     } & ToolAnnotations;
+     canAccess?: (auth: T) => boolean;
+     description?: string;
++    execution?: McpTool["execution"];
+     execute: (args: StandardSchemaV1.InferOutput<Params>, context: Context<T>) => Promise<AudioContent | ContentResult | ImageContent | ResourceContent | ResourceLink | StandardSchemaV1.InferOutput<OutputParams> | string | TextContent | void>;
++    icons?: McpTool["icons"];
+     name: string;
+     outputSchema?: OutputParams;
+     parameters?: Params;
+     timeoutMs?: number;
++    title?: McpTool["title"];
+ };
+ /**
+  * Tool annotations as defined in MCP Specification (2025-03-26)
+@@ -879,6 +864,8 @@ declare class FastMCPSessionEventEmitter extends FastMCPSessionEventEmitterBase
+ }
+ declare class FastMCPSession<T extends FastMCPSessionAuth = FastMCPSessionAuth> extends FastMCPSessionEventEmitter {
+     #private;
++    get admittedToolNames(): string[];
++    get auth(): T | undefined;
+     get clientCapabilities(): ClientCapabilities | null;
+     get isReady(): boolean;
+     get loggingLevel(): LoggingLevel;
+@@ -886,19 +873,22 @@ declare class FastMCPSession<T extends FastMCPSessionAuth = FastMCPSessionAuth>
+     get server(): Server;
+     get sessionId(): string | undefined;
+     set sessionId(value: string | undefined);
+-    constructor({ auth, icons, instructions, logger, name, onToolCall, ping, prompts, resources, resourcesTemplates, roots, sessionId, stateless, streamKeepalive, title, tools, transportType, utils, version, websiteUrl, }: {
++    constructor({ auth, icons, instructions, logger, name, onToolCall, onTransportStart, ping, prompts, resources, resourcesCapabilities, resourcesTemplates, roots, sessionId, sessionResourceProvider, stateless, streamKeepalive, title, tools, transportType, utils, version, websiteUrl, }: {
+         auth?: T;
+         icons?: Icon[];
+         instructions?: string;
+         logger: Logger;
+         name: string;
+         onToolCall?: ServerOptions<T>["onToolCall"];
++        onTransportStart?: ServerOptions<T>["onTransportStart"];
+         ping?: ServerOptions<T>["ping"];
+         prompts: Prompt<T>[];
+         resources: Resource<T>[];
++        resourcesCapabilities?: ServerOptions<T>["resourcesCapabilities"];
+         resourcesTemplates: InputResourceTemplate<T>[];
+         roots?: ServerOptions<T>["roots"];
+         sessionId?: string;
++        sessionResourceProvider?: ServerOptions<FastMCPSessionAuth>["sessionResourceProvider"];
+         stateless?: boolean;
+         streamKeepalive?: ServerOptions<T>["streamKeepalive"];
+         title?: string;
+diff --git a/dist/FastMCP.d.ts b/dist/FastMCP.d.ts
+index 6e54b8d6c70458fd168000e2f7ccc025d48fea24..ade8bc59278a3a06143ce659a0b258ecc153d302 100644
+--- a/dist/FastMCP.d.ts
++++ b/dist/FastMCP.d.ts
+@@ -2,7 +2,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+ import { EventStore } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+ import { RequestOptions } from '@modelcontextprotocol/sdk/shared/protocol.js';
+ import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
+-import { ResourceLink, ElicitRequestFormParams, ElicitRequestURLParams, ElicitResult, Root, ClientCapabilities, Icon, GetPromptResult, CreateMessageRequestSchema } from '@modelcontextprotocol/sdk/types.js';
++import { ResourceLink, TextContent as McpTextContent, ImageContent as McpImageContent, AudioContent as McpAudioContent, EmbeddedResource, CallToolResult, Tool as McpTool, ElicitRequestFormParams, ElicitRequestURLParams, ElicitResult, Root, ClientCapabilities, Icon, GetPromptResult, CreateMessageRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+ export { Icon, ResourceLink } from '@modelcontextprotocol/sdk/types.js';
+ import { StandardSchemaV1 } from '@standard-schema/spec';
+ import { EventEmitter } from 'events';
+@@ -239,10 +239,7 @@ type Progress = {
+ type SerializableValue = {
+     [key: string]: SerializableValue;
+ } | Literal | SerializableValue[];
+-type TextContent = {
+-    text: string;
+-    type: "text";
+-};
++type TextContent = McpTextContent;
+ type ToolParameters = StandardSchemaV1;
+ declare abstract class FastMCPError extends Error {
+     constructor(message?: string);
+@@ -269,32 +266,11 @@ declare class UnexpectedStateError extends FastMCPError {
+  */
+ declare class UserError extends UnexpectedStateError {
+ }
+-type ImageContent = {
+-    data: string;
+-    mimeType: string;
+-    type: "image";
+-};
+-type AudioContent = {
+-    data: string;
+-    mimeType: string;
+-    type: "audio";
+-};
+-type ResourceContent = {
+-    resource: {
+-        blob?: string;
+-        mimeType?: string;
+-        text?: string;
+-        uri: string;
+-    };
+-    type: "resource";
+-};
+-type Content = AudioContent | ImageContent | ResourceContent | ResourceLink | TextContent;
+-type ContentResult = {
+-    _meta?: Record<string, unknown>;
+-    content: Content[];
+-    isError?: boolean;
+-    structuredContent?: Record<string, unknown>;
+-};
++type ImageContent = McpImageContent;
++type AudioContent = McpAudioContent;
++type ResourceContent = EmbeddedResource;
++type Content = CallToolResult["content"][number];
++type ContentResult = CallToolResult;
+ type Completion = {
+     hasMore?: boolean;
+     total?: number;
+@@ -468,6 +444,11 @@ type ServerOptions<T extends FastMCPSessionAuth> = {
+      */
+     logger?: Logger;
+     name: string;
++    resourcesCapabilities?: {
++        listChanged?: boolean;
++        subscribe?: boolean;
++    };
++    sessionResourceProvider?: (auth?: FastMCPSessionAuth, context?: LoadContext<FastMCPSessionAuth>) => Promise<readonly Resource<FastMCPSessionAuth>[]>;
+     /**
+      * Configuration for OAuth well-known discovery endpoints that can be exposed
+      * when the server is running using HTTP-based transports (SSE or HTTP Stream).
+@@ -674,6 +655,7 @@ type ServerOptions<T extends FastMCPSessionAuth> = {
+         arguments: Record<string, unknown>;
+         toolName: string;
+     }) => Promise<void> | void;
++    onTransportStart?: (transport: Transport) => void;
+     ping?: {
+         /**
+          * Whether ping should be enabled by default.
+@@ -778,11 +760,14 @@ type Tool<T extends FastMCPSessionAuth, Params extends ToolParameters = ToolPara
+     } & ToolAnnotations;
+     canAccess?: (auth: T) => boolean;
+     description?: string;
++    execution?: McpTool["execution"];
+     execute: (args: StandardSchemaV1.InferOutput<Params>, context: Context<T>) => Promise<AudioContent | ContentResult | ImageContent | ResourceContent | ResourceLink | StandardSchemaV1.InferOutput<OutputParams> | string | TextContent | void>;
++    icons?: McpTool["icons"];
+     name: string;
+     outputSchema?: OutputParams;
+     parameters?: Params;
+     timeoutMs?: number;
++    title?: McpTool["title"];
+ };
+ /**
+  * Tool annotations as defined in MCP Specification (2025-03-26)
+@@ -879,6 +864,8 @@ declare class FastMCPSessionEventEmitter extends FastMCPSessionEventEmitterBase
+ }
+ declare class FastMCPSession<T extends FastMCPSessionAuth = FastMCPSessionAuth> extends FastMCPSessionEventEmitter {
+     #private;
++    get admittedToolNames(): string[];
++    get auth(): T | undefined;
+     get clientCapabilities(): ClientCapabilities | null;
+     get isReady(): boolean;
+     get loggingLevel(): LoggingLevel;
+@@ -886,19 +873,22 @@ declare class FastMCPSession<T extends FastMCPSessionAuth = FastMCPSessionAuth>
+     get server(): Server;
+     get sessionId(): string | undefined;
+     set sessionId(value: string | undefined);
+-    constructor({ auth, icons, instructions, logger, name, onToolCall, ping, prompts, resources, resourcesTemplates, roots, sessionId, stateless, streamKeepalive, title, tools, transportType, utils, version, websiteUrl, }: {
++    constructor({ auth, icons, instructions, logger, name, onToolCall, onTransportStart, ping, prompts, resources, resourcesCapabilities, resourcesTemplates, roots, sessionId, sessionResourceProvider, stateless, streamKeepalive, title, tools, transportType, utils, version, websiteUrl, }: {
+         auth?: T;
+         icons?: Icon[];
+         instructions?: string;
+         logger: Logger;
+         name: string;
+         onToolCall?: ServerOptions<T>["onToolCall"];
++        onTransportStart?: ServerOptions<T>["onTransportStart"];
+         ping?: ServerOptions<T>["ping"];
+         prompts: Prompt<T>[];
+         resources: Resource<T>[];
++        resourcesCapabilities?: ServerOptions<T>["resourcesCapabilities"];
+         resourcesTemplates: InputResourceTemplate<T>[];
+         roots?: ServerOptions<T>["roots"];
+         sessionId?: string;
++        sessionResourceProvider?: ServerOptions<FastMCPSessionAuth>["sessionResourceProvider"];
+         stateless?: boolean;
+         streamKeepalive?: ServerOptions<T>["streamKeepalive"];
+         title?: string;
+diff --git a/dist/chunk-JI5H5LIK.js b/dist/chunk-JI5H5LIK.js
+index 8b81d8d1e1cc096bf59b8347e75a50548db5e4a6..02ad04a84e75c2e8b84184485d0528496603cd91 100644
+--- a/dist/chunk-JI5H5LIK.js
++++ b/dist/chunk-JI5H5LIK.js
+@@ -3,6 +3,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+ import {
+   CallToolRequestSchema,
++  CallToolResultSchema,
+   CompleteRequestSchema,
+   ErrorCode,
+   GetPromptRequestSchema,
+@@ -406,12 +407,7 @@ var ContentZodSchema = z.discriminatedUnion("type", [
+   ResourceContentZodSchema,
+   ResourceLinkZodSchema
+ ]);
+-var ContentResultZodSchema = z.object({
+-  _meta: z.record(z.string(), z.unknown()).optional(),
+-  content: ContentZodSchema.array(),
+-  isError: z.boolean().optional(),
+-  structuredContent: z.record(z.string(), z.unknown()).optional()
+-}).strict();
++var ContentResultZodSchema = CallToolResultSchema;
+ var CompletionZodSchema = z.object({
+   /**
+    * Indicates whether there are additional completion options beyond those provided in the current response, even if the exact total is unknown.
+@@ -449,6 +445,12 @@ var ServerState = /* @__PURE__ */ ((ServerState2) => {
+ var FastMCPSessionEventEmitter = class extends FastMCPSessionEventEmitterBase {
+ };
+ var FastMCPSession = class extends FastMCPSessionEventEmitter {
++  get admittedToolNames() {
++    return [...this.#admittedToolNames];
++  }
++  get auth() {
++    return this.#auth;
++  }
+   get clientCapabilities() {
+     return this.#clientCapabilities ?? null;
+   }
+@@ -478,9 +480,12 @@ var FastMCPSession = class extends FastMCPSessionEventEmitter {
+   #loggingLevel = "info";
+   #needsEventLoopFlush = false;
+   #onToolCall;
++  #onTransportStart;
+   #pingConfig;
+   #pingInterval = null;
+   #prompts = /* @__PURE__ */ new Map();
++  #admittedToolNames;
++  #resourcesCapabilities;
+   #resources = /* @__PURE__ */ new Map();
+   #resourceTemplates = /* @__PURE__ */ new Map();
+   #roots = [];
+@@ -498,6 +503,7 @@ var FastMCPSession = class extends FastMCPSessionEventEmitter {
+    */
+   #stateless;
+   #streamKeepaliveConfig;
++  #sessionResourceProvider;
+   /**
+    * Resource URIs the connected client has subscribed to via
+    * `resources/subscribe`. Used to scope `notifications/resources/updated`
+@@ -512,14 +518,17 @@ var FastMCPSession = class extends FastMCPSessionEventEmitter {
+     logger,
+     name,
+     onToolCall,
++    onTransportStart,
+     ping,
+     prompts,
+     resources,
++    resourcesCapabilities,
+     resourcesTemplates,
+     roots,
+     sessionId,
+     stateless = false,
+     streamKeepalive,
++    sessionResourceProvider,
+     title,
+     tools,
+     transportType,
+@@ -531,17 +540,25 @@ var FastMCPSession = class extends FastMCPSessionEventEmitter {
+     this.#auth = auth;
+     this.#logger = logger;
+     this.#onToolCall = onToolCall;
++    this.#onTransportStart = onTransportStart;
+     this.#pingConfig = ping;
+     this.#rootsConfig = roots;
++    this.#admittedToolNames = tools.map((tool) => tool.name);
++    this.#resourcesCapabilities = {
++      listChanged: resourcesCapabilities?.listChanged ?? true,
++      subscribe: resourcesCapabilities?.subscribe ?? true
++    };
+     this.#sessionId = sessionId;
+     this.#stateless = stateless;
+     this.#streamKeepaliveConfig = streamKeepalive;
++    this.#sessionResourceProvider = sessionResourceProvider;
+     this.#needsEventLoopFlush = transportType === "httpStream";
+     if (tools.length) {
+       this.#capabilities.tools = {};
+     }
+-    if (resources.length || resourcesTemplates.length) {
+-      this.#capabilities.resources = { listChanged: true, subscribe: true };
++    const hasResources = resources.length || resourcesTemplates.length || sessionResourceProvider;
++    if (hasResources) {
++      this.#capabilities.resources = this.#resourcesCapabilities;
+     }
+     if (prompts.length) {
+       for (const prompt of prompts) {
+@@ -569,12 +586,14 @@ var FastMCPSession = class extends FastMCPSessionEventEmitter {
+     if (tools.length) {
+       this.setupToolHandlers(tools);
+     }
+-    if (resources.length || resourcesTemplates.length) {
++    if (hasResources) {
+       for (const resource of resources) {
+         this.addResource(resource);
+       }
+       this.setupResourceHandlers();
+-      this.setupResourceSubscriptionHandlers();
++      if (this.#resourcesCapabilities.subscribe) {
++        this.setupResourceSubscriptionHandlers();
++      }
+       if (resourcesTemplates.length) {
+         for (const resourceTemplate of resourcesTemplates) {
+           this.addResourceTemplate(resourceTemplate);
+@@ -603,6 +622,13 @@ var FastMCPSession = class extends FastMCPSessionEventEmitter {
+     }
+     this.#connectionState = "connecting";
+     try {
++      if (this.#onTransportStart) {
++        const start = transport.start.bind(transport);
++        transport.start = () => {
++          this.#onTransportStart(transport);
++          return start();
++        };
++      }
+       await this.#server.connect(transport);
+       if ("sessionId" in transport) {
+         const transportWithSessionId = transport;
+@@ -702,7 +728,9 @@ ${e instanceof Error ? e.stack : JSON.stringify(e)}`
+       this.addResource(resource);
+     }
+     this.setupResourceHandlers();
+-    this.triggerListChangedNotification("notifications/resources/list_changed");
++    if (this.#resourcesCapabilities.listChanged) {
++      this.triggerListChangedNotification("notifications/resources/list_changed");
++    }
+   }
+   resourceTemplatesListChanged(resourceTemplates) {
+     this.#resourceTemplates.clear();
+@@ -710,7 +738,9 @@ ${e instanceof Error ? e.stack : JSON.stringify(e)}`
+       this.addResourceTemplate(resourceTemplate);
+     }
+     this.setupResourceTemplateHandlers();
+-    this.triggerListChangedNotification("notifications/resources/list_changed");
++    if (this.#resourcesCapabilities.listChanged) {
++      this.triggerListChangedNotification("notifications/resources/list_changed");
++    }
+   }
+   /**
+    * Notifies the connected client that the contents of a resource have changed.
+@@ -809,6 +839,21 @@ ${error instanceof Error ? error.stack : JSON.stringify(error)}`
+       sessionId: this.#sessionId
+     };
+   }
++  async #sessionResources(meta) {
++    const resources = Array.from(this.#resources.values());
++    if (!this.#sessionResourceProvider) {
++      return resources;
++    }
++    const provided = await this.#sessionResourceProvider(
++      this.#auth,
++      this.#createLoadContext(meta)
++    );
++    const staticUris = new Set(resources.map((resource) => resource.uri));
++    return [
++      ...resources,
++      ...provided.filter((resource) => !staticUris.has(resource.uri))
++    ];
++  }
+   #createLog() {
+     return {
+       debug: (message, context) => {
+@@ -851,10 +896,20 @@ ${error instanceof Error ? error.stack : JSON.stringify(error)}`
+   }
+   #formatSchemaIssues(issues) {
+     return this.#utils?.formatInvalidParamsErrorMessage ? this.#utils.formatInvalidParamsErrorMessage(issues) : issues.map((issue) => {
+-      const path = issue.path?.join(".") || "root";
++      const path = (issue.path ?? []).reduce((current, segment) => {
++        const key = typeof segment === "object" && segment !== null && "key" in segment ? segment.key : segment;
++        if (typeof key === "number") return `${current}[${key}]`;
++        const name = String(key);
++        return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name) ? `${current}.${name}` : `${current}[${JSON.stringify(name)}]`;
++      }, "$");
+       return `${path}: ${issue.message}`;
+     }).join(", ");
+   }
++  async #formatToolSchemaIssues(issues, schema, schemaName) {
++    const convertedSchema = await toJsonSchema(schema);
++    const expectedSchema = schemaName === "input" ? strictJsonSchema(convertedSchema) : convertedSchema;
++    return `${this.#formatSchemaIssues(issues)}. Expected ${schemaName} schema: ${JSON.stringify(expectedSchema)}`;
++  }
+   #getPingConfig(transport) {
+     const pingConfig = this.#pingConfig || {};
+     let defaultEnabled = false;
+@@ -913,8 +968,13 @@ ${error instanceof Error ? error.stack : JSON.stringify(error)}`
+     }
+     const parsed = await tool.outputSchema["~standard"].validate(value);
+     if (parsed.issues) {
++      const friendlyErrors = await this.#formatToolSchemaIssues(
++        parsed.issues,
++        tool.outputSchema,
++        "output"
++      );
+       throw new UserError(
+-        `Tool '${toolName}' structured output validation failed: ${this.#formatSchemaIssues(parsed.issues)}. Please check the result matches the tool's outputSchema.`
++        `Tool '${toolName}' structured output validation failed: ${friendlyErrors}`
+       );
+     }
+     return parsed.value;
+@@ -1134,13 +1194,13 @@ ${error instanceof Error ? error.stack : JSON.stringify(error)}`
+   }
+   setupResourceHandlers() {
+     let cachedResourcesList = null;
+-    this.#server.setRequestHandler(ListResourcesRequestSchema, async () => {
+-      if (cachedResourcesList) {
++    this.#server.setRequestHandler(ListResourcesRequestSchema, async (request) => {
++      if (!this.#sessionResourceProvider && cachedResourcesList) {
+         return {
+           resources: cachedResourcesList
+         };
+       }
+-      cachedResourcesList = Array.from(this.#resources.values()).map(
++      const resources = (await this.#sessionResources(request.params?._meta)).map(
+         (resource) => ({
+           description: resource.description,
+           mimeType: resource.mimeType,
+@@ -1148,15 +1208,19 @@ ${error instanceof Error ? error.stack : JSON.stringify(error)}`
+           uri: resource.uri
+         })
+       );
++      if (!this.#sessionResourceProvider) {
++        cachedResourcesList = resources;
++      }
+       return {
+-        resources: cachedResourcesList
++        resources
+       };
+     });
+     this.#server.setRequestHandler(
+       ReadResourceRequestSchema,
+       async (request) => {
+         if ("uri" in request.params) {
+-          const resource = this.#resources.get(request.params.uri);
++          const resources = await this.#sessionResources(request.params?._meta);
++          const resource = resources.find((candidate) => candidate.uri === request.params.uri);
+           if (!resource) {
+             for (const resourceTemplate of this.#resourceTemplates.values()) {
+               const uriTemplate = parseURITemplate(
+@@ -1185,7 +1249,7 @@ ${error instanceof Error ? error.stack : JSON.stringify(error)}`
+             }
+             throw new McpError(
+               ErrorCode.MethodNotFound,
+-              `Resource not found: '${request.params.uri}'. Available resources: ${Array.from(this.#resources.values()).map((r) => r.uri).join(", ") || "none"}`
++              `Resource not found: '${request.params.uri}'. Available resources: ${resources.map((r) => r.uri).join(", ") || "none"}`
+             );
+           }
+           if (!("uri" in resource)) {
+@@ -1314,10 +1378,11 @@ ${error instanceof Error ? error.stack : JSON.stringify(error)}`
+               type: "object"
+             },
+             name: tool.name,
++            ...tool.title !== void 0 && { title: tool.title },
++            ...tool.icons !== void 0 && { icons: tool.icons },
++            ...tool.execution !== void 0 && { execution: tool.execution },
+             ...tool.outputSchema && {
+-              outputSchema: strictJsonSchema(
+-                await toJsonSchema(tool.outputSchema)
+-              )
++              outputSchema: await toJsonSchema(tool.outputSchema)
+             },
+             // Pass through _meta for MCP ext-apps UI support (issue #229)
+             ...tool._meta && { _meta: tool._meta }
+@@ -1344,10 +1409,14 @@ ${error instanceof Error ? error.stack : JSON.stringify(error)}`
+             request.params.arguments
+           );
+           if (parsed.issues) {
+-            const friendlyErrors = this.#formatSchemaIssues(parsed.issues);
++            const friendlyErrors = await this.#formatToolSchemaIssues(
++              parsed.issues,
++              tool.parameters,
++              "input"
++            );
+             throw new McpError(
+               ErrorCode.InvalidParams,
+-              `Tool '${request.params.name}' parameter validation failed: ${friendlyErrors}. Please check the parameter types and values according to the tool's schema.`
++              `Tool '${request.params.name}' parameter validation failed: ${friendlyErrors}`
+             );
+           }
+           args = parsed.value;
+@@ -1929,6 +1998,9 @@ var FastMCP = class extends FastMCPEventEmitter {
+           );
+         }
+       }
++      const allowedTools = this.#tools.filter(
++        (tool) => tool.canAccess ? auth !== void 0 && tool.canAccess(auth) : true
++      );
+       const session = new FastMCPSession({
+         auth,
+         icons: this.#options.icons,
+@@ -1936,14 +2008,17 @@ var FastMCP = class extends FastMCPEventEmitter {
+         logger: this.#logger,
+         name: this.#options.name,
+         onToolCall: this.#options.onToolCall,
++        onTransportStart: this.#options.onTransportStart,
+         ping: this.#options.ping,
+         prompts: this.#prompts,
+         resources: this.#resources,
++        resourcesCapabilities: this.#options.resourcesCapabilities,
+         resourcesTemplates: this.#resourcesTemplates,
+         roots: this.#options.roots,
++        sessionResourceProvider: this.#options.sessionResourceProvider,
+         streamKeepalive: this.#options.streamKeepalive,
+         title: this.#options.title,
+-        tools: this.#tools,
++        tools: allowedTools,
+         transportType: "stdio",
+         utils: this.#options.utils,
+         version: this.#options.version,
+@@ -2137,12 +2212,15 @@ var FastMCP = class extends FastMCPEventEmitter {
+       logger: this.#logger,
+       name: this.#options.name,
+       onToolCall: this.#options.onToolCall,
++      onTransportStart: this.#options.onTransportStart,
+       ping: this.#options.ping,
+       prompts: this.#prompts,
+       resources: this.#resources,
++      resourcesCapabilities: this.#options.resourcesCapabilities,
+       resourcesTemplates: this.#resourcesTemplates,
+       roots: this.#options.roots,
+       sessionId,
++      sessionResourceProvider: this.#options.sessionResourceProvider,
+       stateless,
+       streamKeepalive: this.#options.streamKeepalive,
+       title: this.#options.title,
+diff --git a/dist/chunk-MD6EC4EY.cjs b/dist/chunk-MD6EC4EY.cjs
+index 52130529a64ca9b4478a9fb80cf01d1ec994f4d8..2e6d532c19a6af1c6f9e73df5f4775a1f88cc886 100644
+--- a/dist/chunk-MD6EC4EY.cjs
++++ b/dist/chunk-MD6EC4EY.cjs
+@@ -406,12 +406,7 @@ var ContentZodSchema = _zod.z.discriminatedUnion("type", [
+   ResourceContentZodSchema,
+   ResourceLinkZodSchema
+ ]);
+-var ContentResultZodSchema = _zod.z.object({
+-  _meta: _zod.z.record(_zod.z.string(), _zod.z.unknown()).optional(),
+-  content: ContentZodSchema.array(),
+-  isError: _zod.z.boolean().optional(),
+-  structuredContent: _zod.z.record(_zod.z.string(), _zod.z.unknown()).optional()
+-}).strict();
++var ContentResultZodSchema = _typesjs.CallToolResultSchema;
+ var CompletionZodSchema = _zod.z.object({
+   /**
+    * Indicates whether there are additional completion options beyond those provided in the current response, even if the exact total is unknown.
+@@ -449,6 +444,12 @@ var ServerState = /* @__PURE__ */ ((ServerState2) => {
+ var FastMCPSessionEventEmitter = class extends FastMCPSessionEventEmitterBase {
+ };
+ var FastMCPSession = class extends FastMCPSessionEventEmitter {
++  get admittedToolNames() {
++    return [...this.#admittedToolNames];
++  }
++  get auth() {
++    return this.#auth;
++  }
+   get clientCapabilities() {
+     return _nullishCoalesce(this.#clientCapabilities, () => ( null));
+   }
+@@ -478,9 +479,12 @@ var FastMCPSession = class extends FastMCPSessionEventEmitter {
+   #loggingLevel = "info";
+   #needsEventLoopFlush = false;
+   #onToolCall;
++  #onTransportStart;
+   #pingConfig;
+   #pingInterval = null;
+   #prompts = /* @__PURE__ */ new Map();
++  #admittedToolNames;
++  #resourcesCapabilities;
+   #resources = /* @__PURE__ */ new Map();
+   #resourceTemplates = /* @__PURE__ */ new Map();
+   #roots = [];
+@@ -498,6 +502,7 @@ var FastMCPSession = class extends FastMCPSessionEventEmitter {
+    */
+   #stateless;
+   #streamKeepaliveConfig;
++  #sessionResourceProvider;
+   /**
+    * Resource URIs the connected client has subscribed to via
+    * `resources/subscribe`. Used to scope `notifications/resources/updated`
+@@ -512,14 +517,17 @@ var FastMCPSession = class extends FastMCPSessionEventEmitter {
+     logger,
+     name,
+     onToolCall,
++    onTransportStart,
+     ping,
+     prompts,
+     resources,
++    resourcesCapabilities,
+     resourcesTemplates,
+     roots,
+     sessionId,
+     stateless = false,
+     streamKeepalive,
++    sessionResourceProvider,
+     title,
+     tools,
+     transportType,
+@@ -531,17 +539,25 @@ var FastMCPSession = class extends FastMCPSessionEventEmitter {
+     this.#auth = auth;
+     this.#logger = logger;
+     this.#onToolCall = onToolCall;
++    this.#onTransportStart = onTransportStart;
+     this.#pingConfig = ping;
+     this.#rootsConfig = roots;
++    this.#admittedToolNames = tools.map((tool) => tool.name);
++    this.#resourcesCapabilities = {
++      listChanged: _nullishCoalesce(_optionalChain([resourcesCapabilities, 'optionalAccess', _ => _.listChanged]), () => ( true)),
++      subscribe: _nullishCoalesce(_optionalChain([resourcesCapabilities, 'optionalAccess', _2 => _2.subscribe]), () => ( true))
++    };
+     this.#sessionId = sessionId;
+     this.#stateless = stateless;
+     this.#streamKeepaliveConfig = streamKeepalive;
++    this.#sessionResourceProvider = sessionResourceProvider;
+     this.#needsEventLoopFlush = transportType === "httpStream";
+     if (tools.length) {
+       this.#capabilities.tools = {};
+     }
+-    if (resources.length || resourcesTemplates.length) {
+-      this.#capabilities.resources = { listChanged: true, subscribe: true };
++    const hasResources = resources.length || resourcesTemplates.length || sessionResourceProvider;
++    if (hasResources) {
++      this.#capabilities.resources = this.#resourcesCapabilities;
+     }
+     if (prompts.length) {
+       for (const prompt of prompts) {
+@@ -569,12 +585,14 @@ var FastMCPSession = class extends FastMCPSessionEventEmitter {
+     if (tools.length) {
+       this.setupToolHandlers(tools);
+     }
+-    if (resources.length || resourcesTemplates.length) {
++    if (hasResources) {
+       for (const resource of resources) {
+         this.addResource(resource);
+       }
+       this.setupResourceHandlers();
+-      this.setupResourceSubscriptionHandlers();
++      if (this.#resourcesCapabilities.subscribe) {
++        this.setupResourceSubscriptionHandlers();
++      }
+       if (resourcesTemplates.length) {
+         for (const resourceTemplate of resourcesTemplates) {
+           this.addResourceTemplate(resourceTemplate);
+@@ -603,6 +621,13 @@ var FastMCPSession = class extends FastMCPSessionEventEmitter {
+     }
+     this.#connectionState = "connecting";
+     try {
++      if (this.#onTransportStart) {
++        const start = transport.start.bind(transport);
++        transport.start = () => {
++          this.#onTransportStart(transport);
++          return start();
++        };
++      }
+       await this.#server.connect(transport);
+       if ("sessionId" in transport) {
+         const transportWithSessionId = transport;
+@@ -702,7 +727,9 @@ ${e instanceof Error ? e.stack : JSON.stringify(e)}`
+       this.addResource(resource);
+     }
+     this.setupResourceHandlers();
+-    this.triggerListChangedNotification("notifications/resources/list_changed");
++    if (this.#resourcesCapabilities.listChanged) {
++      this.triggerListChangedNotification("notifications/resources/list_changed");
++    }
+   }
+   resourceTemplatesListChanged(resourceTemplates) {
+     this.#resourceTemplates.clear();
+@@ -710,7 +737,9 @@ ${e instanceof Error ? e.stack : JSON.stringify(e)}`
+       this.addResourceTemplate(resourceTemplate);
+     }
+     this.setupResourceTemplateHandlers();
+-    this.triggerListChangedNotification("notifications/resources/list_changed");
++    if (this.#resourcesCapabilities.listChanged) {
++      this.triggerListChangedNotification("notifications/resources/list_changed");
++    }
+   }
+   /**
+    * Notifies the connected client that the contents of a resource have changed.
+@@ -809,6 +838,21 @@ ${error instanceof Error ? error.stack : JSON.stringify(error)}`
+       sessionId: this.#sessionId
+     };
+   }
++  async #sessionResources(meta) {
++    const resources = Array.from(this.#resources.values());
++    if (!this.#sessionResourceProvider) {
++      return resources;
++    }
++    const provided = await this.#sessionResourceProvider(
++      this.#auth,
++      this.#createLoadContext(meta)
++    );
++    const staticUris = new Set(resources.map((resource) => resource.uri));
++    return [
++      ...resources,
++      ...provided.filter((resource) => !staticUris.has(resource.uri))
++    ];
++  }
+   #createLog() {
+     return {
+       debug: (message, context) => {
+@@ -851,10 +895,20 @@ ${error instanceof Error ? error.stack : JSON.stringify(error)}`
+   }
+   #formatSchemaIssues(issues) {
+     return _optionalChain([this, 'access', _16 => _16.#utils, 'optionalAccess', _17 => _17.formatInvalidParamsErrorMessage]) ? this.#utils.formatInvalidParamsErrorMessage(issues) : issues.map((issue) => {
+-      const path = _optionalChain([issue, 'access', _18 => _18.path, 'optionalAccess', _19 => _19.join, 'call', _20 => _20(".")]) || "root";
++      const path = (issue.path || []).reduce((current, segment) => {
++        const key = typeof segment === "object" && segment !== null && "key" in segment ? segment.key : segment;
++        if (typeof key === "number") return `${current}[${key}]`;
++        const name = String(key);
++        return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name) ? `${current}.${name}` : `${current}[${JSON.stringify(name)}]`;
++      }, "$");
+       return `${path}: ${issue.message}`;
+     }).join(", ");
+   }
++  async #formatToolSchemaIssues(issues, schema, schemaName) {
++    const convertedSchema = await _xsschema.toJsonSchema.call(void 0, schema);
++    const expectedSchema = schemaName === "input" ? _xsschema.strictJsonSchema.call(void 0, convertedSchema) : convertedSchema;
++    return `${this.#formatSchemaIssues(issues)}. Expected ${schemaName} schema: ${JSON.stringify(expectedSchema)}`;
++  }
+   #getPingConfig(transport) {
+     const pingConfig = this.#pingConfig || {};
+     let defaultEnabled = false;
+@@ -913,8 +967,13 @@ ${error instanceof Error ? error.stack : JSON.stringify(error)}`
+     }
+     const parsed = await tool.outputSchema["~standard"].validate(value);
+     if (parsed.issues) {
++      const friendlyErrors = await this.#formatToolSchemaIssues(
++        parsed.issues,
++        tool.outputSchema,
++        "output"
++      );
+       throw new UserError(
+-        `Tool '${toolName}' structured output validation failed: ${this.#formatSchemaIssues(parsed.issues)}. Please check the result matches the tool's outputSchema.`
++        `Tool '${toolName}' structured output validation failed: ${friendlyErrors}`
+       );
+     }
+     return parsed.value;
+@@ -1134,13 +1193,13 @@ ${error instanceof Error ? error.stack : JSON.stringify(error)}`
+   }
+   setupResourceHandlers() {
+     let cachedResourcesList = null;
+-    this.#server.setRequestHandler(_typesjs.ListResourcesRequestSchema, async () => {
+-      if (cachedResourcesList) {
++    this.#server.setRequestHandler(_typesjs.ListResourcesRequestSchema, async (request) => {
++      if (!this.#sessionResourceProvider && cachedResourcesList) {
+         return {
+           resources: cachedResourcesList
+         };
+       }
+-      cachedResourcesList = Array.from(this.#resources.values()).map(
++      const resources = (await this.#sessionResources(_optionalChain([request, 'access', _33 => _33.params, 'optionalAccess', _34 => _34._meta]))).map(
+         (resource) => ({
+           description: resource.description,
+           mimeType: resource.mimeType,
+@@ -1148,18 +1207,22 @@ ${error instanceof Error ? error.stack : JSON.stringify(error)}`
+           uri: resource.uri
+         })
+       );
++      if (!this.#sessionResourceProvider) {
++        cachedResourcesList = resources;
++      }
+       return {
+-        resources: cachedResourcesList
++        resources
+       };
+     });
+     this.#server.setRequestHandler(
+       _typesjs.ReadResourceRequestSchema,
+       async (request) => {
+         if ("uri" in request.params) {
+-          const resource = this.#resources.get(request.params.uri);
++          const resources = await this.#sessionResources(_optionalChain([request, 'access', _35 => _35.params, 'optionalAccess', _36 => _36._meta]));
++          const resource = resources.find((candidate) => candidate.uri === request.params.uri);
+           if (!resource) {
+             for (const resourceTemplate of this.#resourceTemplates.values()) {
+-              const uriTemplate = _uritemplates2.default.call(void 0, 
++              const uriTemplate = _uritemplates2.default.call(void 0,
+                 resourceTemplate.uriTemplate
+               );
+               const match = uriTemplate.fromUri(request.params.uri);
+@@ -1185,7 +1248,7 @@ ${error instanceof Error ? error.stack : JSON.stringify(error)}`
+             }
+             throw new (0, _typesjs.McpError)(
+               _typesjs.ErrorCode.MethodNotFound,
+-              `Resource not found: '${request.params.uri}'. Available resources: ${Array.from(this.#resources.values()).map((r) => r.uri).join(", ") || "none"}`
++              `Resource not found: '${request.params.uri}'. Available resources: ${resources.map((r) => r.uri).join(", ") || "none"}`
+             );
+           }
+           if (!("uri" in resource)) {
+@@ -1314,10 +1377,11 @@ ${error instanceof Error ? error.stack : JSON.stringify(error)}`
+               type: "object"
+             },
+             name: tool.name,
++            ...tool.title !== void 0 && { title: tool.title },
++            ...tool.icons !== void 0 && { icons: tool.icons },
++            ...tool.execution !== void 0 && { execution: tool.execution },
+             ...tool.outputSchema && {
+-              outputSchema: _xsschema.strictJsonSchema.call(void 0, 
+-                await _xsschema.toJsonSchema.call(void 0, tool.outputSchema)
+-              )
++              outputSchema: await _xsschema.toJsonSchema.call(void 0, tool.outputSchema)
+             },
+             // Pass through _meta for MCP ext-apps UI support (issue #229)
+             ...tool._meta && { _meta: tool._meta }
+@@ -1344,10 +1408,14 @@ ${error instanceof Error ? error.stack : JSON.stringify(error)}`
+             request.params.arguments
+           );
+           if (parsed.issues) {
+-            const friendlyErrors = this.#formatSchemaIssues(parsed.issues);
++            const friendlyErrors = await this.#formatToolSchemaIssues(
++              parsed.issues,
++              tool.parameters,
++              "input"
++            );
+             throw new (0, _typesjs.McpError)(
+               _typesjs.ErrorCode.InvalidParams,
+-              `Tool '${request.params.name}' parameter validation failed: ${friendlyErrors}. Please check the parameter types and values according to the tool's schema.`
++              `Tool '${request.params.name}' parameter validation failed: ${friendlyErrors}`
+             );
+           }
+           args = parsed.value;
+@@ -1929,6 +1997,9 @@ var FastMCP = class extends FastMCPEventEmitter {
+           );
+         }
+       }
++      const allowedTools = this.#tools.filter(
++        (tool) => tool.canAccess ? auth !== void 0 && tool.canAccess(auth) : true
++      );
+       const session = new FastMCPSession({
+         auth,
+         icons: this.#options.icons,
+@@ -1936,14 +2007,17 @@ var FastMCP = class extends FastMCPEventEmitter {
+         logger: this.#logger,
+         name: this.#options.name,
+         onToolCall: this.#options.onToolCall,
++        onTransportStart: this.#options.onTransportStart,
+         ping: this.#options.ping,
+         prompts: this.#prompts,
+         resources: this.#resources,
++        resourcesCapabilities: this.#options.resourcesCapabilities,
+         resourcesTemplates: this.#resourcesTemplates,
+         roots: this.#options.roots,
++        sessionResourceProvider: this.#options.sessionResourceProvider,
+         streamKeepalive: this.#options.streamKeepalive,
+         title: this.#options.title,
+-        tools: this.#tools,
++        tools: allowedTools,
+         transportType: "stdio",
+         utils: this.#options.utils,
+         version: this.#options.version,
+@@ -2137,12 +2211,15 @@ var FastMCP = class extends FastMCPEventEmitter {
+       logger: this.#logger,
+       name: this.#options.name,
+       onToolCall: this.#options.onToolCall,
++      onTransportStart: this.#options.onTransportStart,
+       ping: this.#options.ping,
+       prompts: this.#prompts,
+       resources: this.#resources,
++      resourcesCapabilities: this.#options.resourcesCapabilities,
+       resourcesTemplates: this.#resourcesTemplates,
+       roots: this.#options.roots,
+       sessionId,
++      sessionResourceProvider: this.#options.sessionResourceProvider,
+       stateless,
+       streamKeepalive: this.#options.streamKeepalive,
+       title: this.#options.title,
+diff --git a/dist/edge/index.d.cts b/dist/edge/index.d.cts
+index 0869d2f467f57ef28524100b5eb19b53f2517189..246b97e6274015be1cb72b1d0db5e72ae4554506 100644
+--- a/dist/edge/index.d.cts
++++ b/dist/edge/index.d.cts
+@@ -4,2 +4,3 @@ import { z } from 'zod';
+ import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
++import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+ import { JSONRPCMessage, MessageExtraInfo, RequestId } from '@modelcontextprotocol/sdk/types.js';
+@@ -225,17 +226,11 @@ interface EdgeResource {
+ /**
+  * Tool definition for EdgeFastMCP
+  */
+-interface EdgeTool<TParams = unknown> {
++interface EdgeTool<TParams = unknown, TOutput = unknown> {
+     description: string;
+-    execute: (params: TParams) => Promise<{
+-        content: Array<{
+-            data?: string;
+-            mimeType?: string;
+-            text?: string;
+-            type: string;
+-        }>;
+-    } | string>;
++    execute: (params: TParams) => Promise<CallToolResult | TOutput | string>;
+     name: string;
++    outputSchema?: StandardSchemaV1<unknown, TOutput> | z.ZodType<TOutput>;
+     parameters?: StandardSchemaV1<TParams> | z.ZodType<TParams>;
+ }
+ /**
+@@ -258,7 +253,7 @@ declare class EdgeFastMCP {
+     /**
+      * Add a tool to the server
+      */
+-    addTool<TParams>(tool: EdgeTool<TParams>): this;
++    addTool<TParams, TOutput = unknown>(tool: EdgeTool<TParams, TOutput>): this;
+     /**
+      * Handle an incoming request (main entry point for edge runtimes)
+      */
+diff --git a/dist/edge/index.d.ts b/dist/edge/index.d.ts
+index 0869d2f467f57ef28524100b5eb19b53f2517189..246b97e6274015be1cb72b1d0db5e72ae4554506 100644
+--- a/dist/edge/index.d.ts
++++ b/dist/edge/index.d.ts
+@@ -4,2 +4,3 @@ import { z } from 'zod';
+ import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
++import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+ import { JSONRPCMessage, MessageExtraInfo, RequestId } from '@modelcontextprotocol/sdk/types.js';
+@@ -225,17 +226,11 @@ interface EdgeResource {
+ /**
+  * Tool definition for EdgeFastMCP
+  */
+-interface EdgeTool<TParams = unknown> {
++interface EdgeTool<TParams = unknown, TOutput = unknown> {
+     description: string;
+-    execute: (params: TParams) => Promise<{
+-        content: Array<{
+-            data?: string;
+-            mimeType?: string;
+-            text?: string;
+-            type: string;
+-        }>;
+-    } | string>;
++    execute: (params: TParams) => Promise<CallToolResult | TOutput | string>;
+     name: string;
++    outputSchema?: StandardSchemaV1<unknown, TOutput> | z.ZodType<TOutput>;
+     parameters?: StandardSchemaV1<TParams> | z.ZodType<TParams>;
+ }
+ /**
+@@ -258,7 +253,7 @@ declare class EdgeFastMCP {
+     /**
+      * Add a tool to the server
+      */
+-    addTool<TParams>(tool: EdgeTool<TParams>): this;
++    addTool<TParams, TOutput = unknown>(tool: EdgeTool<TParams, TOutput>): this;
+     /**
+      * Handle an incoming request (main entry point for edge runtimes)
+      */
+diff --git a/dist/edge/index.cjs b/dist/edge/index.cjs
+index 8bc4b0763045b211010f344080785859a72f5181..55a186dd666406873a43bee67b58f76ed93badca 100644
+--- a/dist/edge/index.cjs
++++ b/dist/edge/index.cjs
+@@ -814,24 +814,83 @@ var EdgeFastMCP = class {
+       }
+       if (parsed.issues) {
+         const friendlyErrors = parsed.issues.map((issue) => {
+-          const path = _optionalChain([issue, 'access', _35 => _35.path, 'optionalAccess', _36 => _36.join, 'call', _37 => _37(".")]) || "root";
++          const path = _nullishCoalesce(issue.path, () => ( [])).reduce((current, segment) => {
++            const key = typeof segment === "object" && segment !== null && "key" in segment ? segment.key : segment;
++            if (typeof key === "number") return `${current}[${key}]`;
++            const name = String(key);
++            return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name) ? `${current}.${name}` : `${current}[${JSON.stringify(name)}]`;
++          }, "$");
+           return `${path}: ${issue.message}`;
+         }).join(", ");
++        const expectedSchema = this.#schemaToJsonSchema(tool.parameters);
+         return this.#rpcError(
+           id,
+           _typesjs.ErrorCode.InvalidParams,
+-          `Tool '${toolName}' parameter validation failed: ${friendlyErrors}. Please check the parameter types and values according to the tool's schema.`
++          `Tool '${toolName}' parameter validation failed: ${friendlyErrors}. Expected input schema: ${JSON.stringify(expectedSchema)}`
+         );
+       }
+       args = parsed.value;
+     }
+     try {
+       const result = await tool.execute(args);
+-      const content = typeof result === "string" ? [{ text: result, type: "text" }] : result.content;
++      if (typeof result === "string") {
++        return {
++          id,
++          jsonrpc: "2.0",
++          result: { content: [{ text: result, type: "text" }] }
++        };
++      }
++      if (result !== null && typeof result === "object" && "content" in result && Array.isArray(result.content) && (!tool.outputSchema || _typesjs.CallToolResultSchema.safeParse(result).success)) {
++        const toolResult = { ...result };
++        if (tool.outputSchema && toolResult.structuredContent !== void 0) {
++          const validated = await this.#validateStructuredContent(
++            tool,
++            toolResult.structuredContent,
++            toolName
++          );
++          if (validated.error) {
++            return {
++              id,
++              jsonrpc: "2.0",
++              result: {
++                content: [{ text: validated.error, type: "text" }],
++                isError: true
++              }
++            };
++          }
++          toolResult.structuredContent = validated.value;
++        }
++        return {
++          id,
++          jsonrpc: "2.0",
++          result: toolResult
++        };
++      }
++      if (tool.outputSchema) {
++        const validated = await this.#validateStructuredContent(tool, result, toolName);
++        if (validated.error) {
++          return {
++            id,
++            jsonrpc: "2.0",
++            result: {
++              content: [{ text: validated.error, type: "text" }],
++              isError: true
++            }
++          };
++        }
++        return {
++          id,
++          jsonrpc: "2.0",
++          result: {
++            content: [{ text: JSON.stringify(validated.value), type: "text" }],
++            structuredContent: validated.value
++          }
++        };
++      }
+       return {
+         id,
+         jsonrpc: "2.0",
+-        result: { content }
++        result: { content: result.content }
+       };
+     } catch (error) {
+       return this.#rpcError(
+@@ -852,11 +911,31 @@ var EdgeFastMCP = class {
+         tools: this.#tools.map((tool) => ({
+           description: tool.description,
+           inputSchema: tool.parameters ? this.#schemaToJsonSchema(tool.parameters) : { type: "object" },
+-          name: tool.name
++          name: tool.name,
++          ...tool.outputSchema && { outputSchema: this.#schemaToJsonSchema(tool.outputSchema, false) }
+         }))
+       }
+     };
+   }
++  async #validateStructuredContent(tool, value, toolName) {
++    const parsed = await tool.outputSchema["~standard"].validate(value);
++    if (parsed.issues) {
++      const friendlyErrors = parsed.issues.map((issue) => {
++        const path = _nullishCoalesce(issue.path, () => ( [])).reduce((current, segment) => {
++          const key = typeof segment === "object" && segment !== null && "key" in segment ? segment.key : segment;
++          if (typeof key === "number") return `${current}[${key}]`;
++          const name = String(key);
++          return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name) ? `${current}.${name}` : `${current}[${JSON.stringify(name)}]`;
++        }, "$");
++        return `${path}: ${issue.message}`;
++      }).join(", ");
++      const expectedSchema = this.#schemaToJsonSchema(tool.outputSchema, false);
++      return {
++        error: `Tool '${toolName}' structured output validation failed: ${friendlyErrors}. Expected output schema: ${JSON.stringify(expectedSchema)}`
++      };
++    }
++    return { value: parsed.value };
++  }
+   /**
+    * Create an RPC error message
+    */
+@@ -870,6 +949,13 @@ var EdgeFastMCP = class {
+   /**
+    * Convert schema to JSON Schema
+    */
+-  #schemaToJsonSchema(schema) {
++  #schemaToJsonSchema(schema, makeStrict = true) {
+     try {
++      if (!makeStrict) {
++        if (typeof _zod.z.toJSONSchema === "function") return _zod.z.toJSONSchema(schema);
++        if ("_def" in schema || schema instanceof _zod.z.ZodType) {
++          return _zodtojsonschema.zodToJsonSchema.call(void 0, schema, { target: "openApi3" });
++        }
++        return { type: "object" };
++      }
+       if (typeof _zod.z.toJSONSchema === "function") {
+diff --git a/dist/edge/index.js b/dist/edge/index.js
+index 77ea42b8f0873f0069083aa1f567641678c07f9a..392906668e4164528c6522b052e210b2e62df46e 100644
+--- a/dist/edge/index.js
++++ b/dist/edge/index.js
+@@ -1,5 +1,6 @@
+ // src/edge/index.ts
+ import {
++  CallToolResultSchema,
+   ErrorCode,
+   LATEST_PROTOCOL_VERSION
+ } from "@modelcontextprotocol/sdk/types.js";
+@@ -814,24 +815,83 @@ var EdgeFastMCP = class {
+       }
+       if (parsed.issues) {
+         const friendlyErrors = parsed.issues.map((issue) => {
+-          const path = issue.path?.join(".") || "root";
++          const path = (issue.path ?? []).reduce((current, segment) => {
++            const key = typeof segment === "object" && segment !== null && "key" in segment ? segment.key : segment;
++            if (typeof key === "number") return `${current}[${key}]`;
++            const name = String(key);
++            return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name) ? `${current}.${name}` : `${current}[${JSON.stringify(name)}]`;
++          }, "$");
+           return `${path}: ${issue.message}`;
+         }).join(", ");
++        const expectedSchema = this.#schemaToJsonSchema(tool.parameters);
+         return this.#rpcError(
+           id,
+           ErrorCode.InvalidParams,
+-          `Tool '${toolName}' parameter validation failed: ${friendlyErrors}. Please check the parameter types and values according to the tool's schema.`
++          `Tool '${toolName}' parameter validation failed: ${friendlyErrors}. Expected input schema: ${JSON.stringify(expectedSchema)}`
+         );
+       }
+       args = parsed.value;
+     }
+     try {
+       const result = await tool.execute(args);
+-      const content = typeof result === "string" ? [{ text: result, type: "text" }] : result.content;
++      if (typeof result === "string") {
++        return {
++          id,
++          jsonrpc: "2.0",
++          result: { content: [{ text: result, type: "text" }] }
++        };
++      }
++      if (result !== null && typeof result === "object" && "content" in result && Array.isArray(result.content) && (!tool.outputSchema || CallToolResultSchema.safeParse(result).success)) {
++        const toolResult = { ...result };
++        if (tool.outputSchema && toolResult.structuredContent !== void 0) {
++          const validated = await this.#validateStructuredContent(
++            tool,
++            toolResult.structuredContent,
++            toolName
++          );
++          if (validated.error) {
++            return {
++              id,
++              jsonrpc: "2.0",
++              result: {
++                content: [{ text: validated.error, type: "text" }],
++                isError: true
++              }
++            };
++          }
++          toolResult.structuredContent = validated.value;
++        }
++        return {
++          id,
++          jsonrpc: "2.0",
++          result: toolResult
++        };
++      }
++      if (tool.outputSchema) {
++        const validated = await this.#validateStructuredContent(tool, result, toolName);
++        if (validated.error) {
++          return {
++            id,
++            jsonrpc: "2.0",
++            result: {
++              content: [{ text: validated.error, type: "text" }],
++              isError: true
++            }
++          };
++        }
++        return {
++          id,
++          jsonrpc: "2.0",
++          result: {
++            content: [{ text: JSON.stringify(validated.value), type: "text" }],
++            structuredContent: validated.value
++          }
++        };
++      }
+       return {
+         id,
+         jsonrpc: "2.0",
+-        result: { content }
++        result: { content: result.content }
+       };
+     } catch (error) {
+       return this.#rpcError(
+@@ -852,11 +912,31 @@ var EdgeFastMCP = class {
+         tools: this.#tools.map((tool) => ({
+           description: tool.description,
+           inputSchema: tool.parameters ? this.#schemaToJsonSchema(tool.parameters) : { type: "object" },
+-          name: tool.name
++          name: tool.name,
++          ...tool.outputSchema && { outputSchema: this.#schemaToJsonSchema(tool.outputSchema, false) }
+         }))
+       }
+     };
+   }
++  async #validateStructuredContent(tool, value, toolName) {
++    const parsed = await tool.outputSchema["~standard"].validate(value);
++    if (parsed.issues) {
++      const friendlyErrors = parsed.issues.map((issue) => {
++        const path = (issue.path ?? []).reduce((current, segment) => {
++          const key = typeof segment === "object" && segment !== null && "key" in segment ? segment.key : segment;
++          if (typeof key === "number") return `${current}[${key}]`;
++          const name = String(key);
++          return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name) ? `${current}.${name}` : `${current}[${JSON.stringify(name)}]`;
++        }, "$");
++        return `${path}: ${issue.message}`;
++      }).join(", ");
++      const expectedSchema = this.#schemaToJsonSchema(tool.outputSchema, false);
++      return {
++        error: `Tool '${toolName}' structured output validation failed: ${friendlyErrors}. Expected output schema: ${JSON.stringify(expectedSchema)}`
++      };
++    }
++    return { value: parsed.value };
++  }
+   /**
+    * Create an RPC error message
+    */
+@@ -870,6 +950,13 @@ var EdgeFastMCP = class {
+   /**
+    * Convert schema to JSON Schema
+    */
+-  #schemaToJsonSchema(schema) {
++  #schemaToJsonSchema(schema, makeStrict = true) {
+     try {
++      if (!makeStrict) {
++        if (typeof z.toJSONSchema === "function") return z.toJSONSchema(schema);
++        if ("_def" in schema || schema instanceof z.ZodType) {
++          return zodToJsonSchema(schema, { target: "openApi3" });
++        }
++        return { type: "object" };
++      }
+       if (typeof z.toJSONSchema === "function") {
