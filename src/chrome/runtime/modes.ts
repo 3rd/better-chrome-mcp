@@ -48,5 +48,8 @@ export const assertMatchingNativeDeviceScaleFactor = (
 export const isSharedMode = (mode: BrowserMode): mode is SharedBrowserMode =>
   mode === "shared" || mode === "shared-headless";
 
+export const isAttachedMode = (mode: BrowserMode): mode is Extract<BrowserMode, "main" | "remote"> =>
+  mode === "main" || mode === "remote";
+
 export const browserOwnership = (mode: BrowserMode): "attached" | "launched" =>
-  mode === "main" ? "attached" : "launched";
+  isAttachedMode(mode) ? "attached" : "launched";

@@ -388,6 +388,7 @@ Inline text and canonical JSON share a ${INLINE_TEXT_MAX_BYTES / 1024} KiB limit
 - \`shared\`: workspace-scoped persistent headed profile shared across MCP connections.
 - \`shared-headless\`: separately persisted headless shared profile.
 - \`main\`: attaches to the user's running Chrome through its remote-debugging endpoint. Select it only under the server instructions' \`main\` rule; a mention of Chrome or the browser does not select it. Remote debugging must already be enabled. It never launches, closes, falls back to another browser, or changes the user's global download policy, so it captures no downloads and records no download events.
+- \`remote\`: attaches to the browser at the server's \`--cdp-endpoint\` (an http(s) endpoint resolved through \`/json/version\`, or a ws(s) browser endpoint). It is unavailable, with \`CHROME_MCP_REMOTE_UNAVAILABLE\`, when the server has no endpoint. Like \`main\`, it never launches or closes the browser and does not change its download behavior, so it captures no downloads.
 
 Visible headed modes use the visible Chrome window as the page viewport. Virtual-display mode starts with a 1,920 by 1,080 viewport at its native launch scale; \`page.setViewportSize()\` preserves that scale through the persistent browser owner. Headless modes start with a deterministic 1,920 by 1,080 viewport.
 

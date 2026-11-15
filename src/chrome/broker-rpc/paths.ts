@@ -6,6 +6,7 @@ import { z } from "zod/v4";
 import { isNodeError } from "../../platform/node-errors";
 import { getMcpRuntimeDir } from "../../platform/runtime-paths";
 import { currentProcessStartIdentity, probeProcessIdentity, workspaceIdentity } from "../runtime";
+import { launchedEngineSchema } from "../runtime/engine-recipes";
 import { BROKER_LOG_FILE, BROKER_METADATA_FILE, BROKER_STARTUP_LOCK_FILE } from "./constants";
 import { BrokerRpcError } from "./errors";
 
@@ -55,7 +56,9 @@ const resolveSocketFileLocation = (runtimeRoot: string, uid: number, workspaceHa
 export const brokerMetadataSchema = z
   .object({
     brokerId: z.string().uuid(),
+    cdpEndpoint: z.string().min(1).optional(),
     createdAt: z.iso.datetime(),
+    engine: launchedEngineSchema.optional(),
     pid: z.number().int().positive(),
     processStartIdentity: z.string().min(1),
     protocolVersion: z.number().int().positive().optional(),

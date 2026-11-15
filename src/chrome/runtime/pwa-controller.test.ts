@@ -168,7 +168,7 @@ test("rejects non-isolated modes before CDP and reports unsupported native comma
   const { connection, receiptPath, controller } = await createController();
   connection.command = () => Promise.reject(new Error("Unexpected CDP call"));
 
-  for (const mode of ["shared", "shared-headless", "main"] as const) {
+  for (const mode of ["shared", "shared-headless", "main", "remote"] as const) {
     expect(
       new PwaController({
         sendCommand: (method, params) => connection.send(method, params),

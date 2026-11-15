@@ -7,6 +7,7 @@ export const BROWSER_MODES = [
   "shared",
   "shared-headless",
   "main",
+  "remote",
 ] as const;
 
 export type BrowserMode = (typeof BROWSER_MODES)[number];

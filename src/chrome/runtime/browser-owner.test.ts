@@ -2,15 +2,24 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { DownloadFinishedInput } from "./target-observer";
 import { type BrowserLauncher, HEADLESS_VIEWPORT, type LaunchChromeOptions } from "./browser-launcher";
-import { BrowserOwner, ChromeBrowserBroker } from "./browser-owner";
+import { BrowserOwner, ChromeBrowserBroker, type ChromeBrowserBrokerOptions } from "./browser-owner";
+import { BUILT_IN_ENGINE_RECIPES } from "./engine-recipes";
 import { FakeCdpClient } from "./fake-cdp-client.test-support";
 import { writeBrowserOwnerMetadata } from "./owner-metadata";
 import { createOwnerKey, resolveChromeRuntimePaths } from "./paths";
 import { PersistentMutationRegistry } from "./persistent-mutations";
+import { currentProcessStartIdentity, probeProcessIdentity } from "./process-identity";
 import { profilePathHash } from "./profile-lease";
 import { PWA_INSTALL_RECEIPT_FILE } from "./pwa-controller";
+import {
+  launchRecipeBrowser,
+  RECIPE_CLOSE_GRACE_MS,
+  type RecipeBrowserLauncher,
+  type RecipeLaunchOptions,
+} from "./recipe-launcher";
 
 const temporaryDirectories: string[] = [];
 
@@ -1767,4 +1776,663 @@ describe("BrowserOwner download attribution", () => {
     await first.close();
     await second.close();
   });
+});
+
+const OBSCURA = { name: "obscura", ...BUILT_IN_ENGINE_RECIPES.obscura };
+const RECIPE_ENDPOINT = "ws://127.0.0.1:9555/devtools/browser/recipe";
+
+const idleViewportConnector: NonNullable<ChromeBrowserBrokerOptions["viewportConnector"]> = async () => ({
+  pageViewport: async () => null,
+  disconnect: async () => undefined,
+});
+
+const recipeFixture = (events: string[], pid = process.pid) => {
+  const launches: RecipeLaunchOptions[] = [];
+  const launcher: RecipeBrowserLauncher = {
+    launch: async (options) => {
+      launches.push(options);
+      return {
+        close: async () => {
+          events.push("stop");
+        },
+        recipe: { browserPid: pid, endpoint: RECIPE_ENDPOINT, exited: Promise.resolve(0) },
+      };
+    },
+  };
+  return { launches, launcher };
+};
+
+const recipeBroker = async (
+  config: Readonly<{
+    onError?: (error: unknown) => void;
+    secondPage?: boolean;
+    viewportConnector?: ChromeBrowserBrokerOptions["viewportConnector"];
+  }> = {},
+) => {
+  const workspacePath = await temporaryDirectory("chrome-recipe-workspace-");
+  const runtimeRoot = await temporaryDirectory("chrome-recipe-runtime-");
+  const events: string[] = [];
+  const { launches, launcher } = recipeFixture(events);
+  const endpoints: string[] = [];
+  const connections: FakeCdpClient[] = [];
+  const targets = new Map<string, TestPageTarget>();
+  if (config.secondPage) {
+    targets.set("page-0", { targetId: "page-0", title: "Initial", type: "page", url: "about:blank" });
+  }
+  const broker = await ChromeBrowserBroker.create({
+    cdpConnector: async (endpoint) => {
+      endpoints.push(endpoint);
+      const connection = pageConnection(endpoint, "page-1", process.pid, () => events.push("Browser.close"), targets);
+      connections.push(connection);
+      return connection;
+    },
+    engine: OBSCURA,
+    env: {},
+    executablePath: process.execPath,
+    onError: config.onError ?? (() => undefined),
+    pathOptions: { dataHome: runtimeRoot, runtimeRoot },
+    recipeLauncher: launcher,
+    viewportConnector: config.viewportConnector ?? idleViewportConnector,
+    workspacePath,
+  });
+  return { broker, connections, endpoints, events, launches, runtimeRoot };
+};
+
+describe("recipe engine owner", () => {
+  test("refuses a visible mode for a headless-only engine before launching anything", async () => {
+    const { broker, launches } = await recipeBroker();
+    await expect(broker.acquire("client-a", "isolated")).rejects.toMatchObject({
+      code: "CHROME_MCP_ENGINE_UNSUPPORTED_MODE",
+      message:
+        'The obscura engine runs headless only, so browser "isolated" is unavailable. Use isolated-headless or shared-headless, or start the server without --engine to use Chrome.',
+    });
+    expect(launches).toHaveLength(0);
+  });
+
+  test("launches a shared-headless recipe engine in its engine profile without Chrome preferences and records the engine", async () => {
+    const { broker, connections, endpoints, events, launches, runtimeRoot } = await recipeBroker();
+    const session = await broker.acquire("client-a", "shared-headless");
+    expect(launches).toHaveLength(1);
+    expect(launches[0]).toMatchObject({
+      command: process.execPath,
+      engine: OBSCURA,
+      profileDir: session.owner.paths.userDataDir,
+    });
+    expect(session.owner.paths.profileRoot).toBe(
+      join(runtimeRoot, "chrome-mcp", "profiles", "obscura", broker.workspaceHash, "shared-headless"),
+    );
+    expect(await Bun.file(join(session.owner.paths.userDataDir, "Default", "Preferences")).exists()).toBe(
+      false,
+    );
+    expect(endpoints).toEqual([RECIPE_ENDPOINT]);
+    const commands = connections.flatMap((connection) => connection.commands);
+    expect(commands.some((c) => c.method === "Browser.setDownloadBehavior")).toBe(true);
+    expect(commands.some((c) => c.method === "SystemInfo.getProcessInfo")).toBe(false);
+    expect(JSON.parse(await readFile(session.owner.paths.ownerMetadataPath, "utf8"))).toMatchObject({
+      engine: "obscura",
+      enginePath: process.execPath,
+      browserPid: process.pid,
+    });
+    await session.close();
+    await broker.close();
+    expect(events).toEqual(["Browser.close", "stop"]);
+  });
+
+  test("adopts a running shared-headless recipe browser only when the engine name and command match", async () => {
+    const workspacePath = await temporaryDirectory("chrome-recipe-adopt-workspace-");
+    const runtimeRoot = await temporaryDirectory("chrome-recipe-adopt-runtime-");
+    const priorEndpoint = "ws://127.0.0.1:9666/devtools/browser/prior";
+    const make = async () => {
+      const events: string[] = [];
+      const { launches, launcher } = recipeFixture(events);
+      const endpoints: string[] = [];
+      const broker = await ChromeBrowserBroker.create({
+        cdpConnector: async (endpoint) => {
+          endpoints.push(endpoint);
+          return pageConnection(endpoint, "page-1", process.pid, () => events.push("Browser.close"));
+        },
+        engine: OBSCURA,
+        env: {},
+        executablePath: process.execPath,
+        onError: () => undefined,
+        pathOptions: { dataHome: runtimeRoot, runtimeRoot },
+        processIdentity: async () => (events.includes("Browser.close") ? "absent" : "same"),
+        recipeLauncher: launcher,
+        viewportConnector: idleViewportConnector,
+        workspacePath,
+      });
+      return { broker, endpoints, launches };
+    };
+    const writePrior = async (broker: ChromeBrowserBroker, enginePath: string) => {
+      const key = createOwnerKey("shared-headless", broker.workspaceHash, "x");
+      const paths = resolveChromeRuntimePaths(key, {
+        dataHome: runtimeRoot,
+        engineName: "obscura",
+        runtimeRoot,
+      });
+      await writeBrowserOwnerMetadata(paths.ownerMetadataPath, {
+        browserPid: process.pid,
+        cleanShutdown: false,
+        endpoint: priorEndpoint,
+        engine: "obscura",
+        enginePath,
+        mode: "shared-headless",
+        ownerGeneration: 1,
+        processStartIdentity: await currentProcessStartIdentity(),
+        profilePathHash: profilePathHash(paths.userDataDir),
+        updatedAt: new Date().toISOString(),
+      });
+    };
+
+    const matching = await make();
+    await writePrior(matching.broker, process.execPath);
+    const adopted = await matching.broker.acquire("client-a", "shared-headless");
+    expect(matching.launches).toHaveLength(0);
+    expect(matching.endpoints[0]).toBe(priorEndpoint);
+    await adopted.close();
+    await matching.broker.close();
+
+    const mismatched = await make();
+    await writePrior(mismatched.broker, join(tmpdir(), "other-obscura"));
+    const launched = await mismatched.broker.acquire("client-a", "shared-headless");
+    expect(mismatched.launches).toHaveLength(1);
+    await launched.close();
+    await mismatched.broker.close();
+  });
+
+  test("applies the 1920x1080 headless viewport to new recipe pages through the endpoint controller", async () => {
+    const requests: unknown[] = [];
+    const { broker } = await recipeBroker({
+      viewportConnector: async () => ({
+        pageViewport: async (request) => {
+          requests.push(request);
+          return null;
+        },
+        disconnect: async () => undefined,
+      }),
+    });
+    const session = await broker.acquire("client-a", "isolated-headless");
+    const expected = { operation: "set", targetId: "page-1", viewport: { width: 1920, height: 1080 } };
+    for (let attempt = 0; attempt < 100 && !requests.some((r) => Bun.deepEquals(r, expected)); attempt++) {
+      await Bun.sleep(10);
+    }
+    expect(requests).toContainEqual(expected);
+    await session.close();
+    await broker.close();
+  });
+
+  test("has the default viewport on the initial recipe page before the owner is created", async () => {
+    const stored = new Map<string, unknown>();
+    const { broker } = await recipeBroker({
+      viewportConnector: async () => ({
+        pageViewport: async (request) => {
+          if (request.operation === "read") return (stored.get(request.targetId) as never) ?? null;
+          await Bun.sleep(50);
+          stored.set(request.targetId, request.viewport);
+          return request.viewport;
+        },
+        disconnect: async () => undefined,
+      }),
+    });
+    const session = await broker.acquire("client-a", "isolated-headless");
+    expect(stored.get("page-1")).toEqual({ width: 1920, height: 1080 });
+    await session.close();
+    await broker.close();
+  });
+
+  test("does not overwrite a client viewport with the delayed default on a later recipe page", async () => {
+    const stored = new Map<string, unknown>();
+    const writes: unknown[] = [];
+    let holdDefault: (() => void) | undefined;
+    const defaultHeld = new Promise<void>((resolve) => {
+      holdDefault = resolve;
+    });
+    const { broker, connections } = await recipeBroker({
+      viewportConnector: async () => ({
+        pageViewport: async (request) => {
+          if (request.operation === "read") {
+            if (request.targetId === "blank-1") await defaultHeld;
+            return (stored.get(request.targetId) as never) ?? null;
+          }
+          if (request.targetId === "blank-1" && request.viewport.width === 1920) await defaultHeld;
+          writes.push(request.viewport);
+          stored.set(request.targetId, request.viewport);
+          return request.viewport;
+        },
+        disconnect: async () => undefined,
+      }),
+    });
+    const session = await broker.acquire("client-a", "isolated-headless");
+    await connections[0]?.send("Target.createTarget", { url: "about:blank" });
+    const client = { height: 600, width: 800 };
+    const clientSet = session.owner.pageViewport(
+      { operation: "set", targetId: "blank-1", viewport: client },
+      new AbortController().signal,
+    );
+    await clientSet;
+    holdDefault?.();
+    await Bun.sleep(50);
+    expect(stored.get("blank-1")).toEqual(client);
+    expect(writes).toEqual([{ width: 1920, height: 1080 }, client]);
+    await session.close();
+    await broker.close();
+  });
+
+  test("keeps the engine's default viewport after the endpoint controller fails once", async () => {
+    let connectorCalls = 0;
+    const errors: unknown[] = [];
+    const { broker } = await recipeBroker({
+      onError: (error) => errors.push(error),
+      secondPage: true,
+      viewportConnector: async () => {
+        connectorCalls++;
+        throw new Error("viewport controller unavailable");
+      },
+    });
+    const session = await broker.acquire("client-a", "isolated-headless");
+    await Bun.sleep(100);
+    expect(connectorCalls).toBe(1);
+    expect(errors).toEqual([]);
+    await session.close();
+    await broker.close();
+  });
+
+  test("ignores the engine for main and keeps Chrome launches unchanged without one", async () => {
+    const events: string[] = [];
+    const { launches, launcher } = recipeFixture(events);
+    const workspacePath = await temporaryDirectory("chrome-recipe-main-workspace-");
+    const runtimeRoot = await temporaryDirectory("chrome-recipe-main-runtime-");
+    const mainBroker = await ChromeBrowserBroker.create({
+      cdpConnector: async (endpoint) => pageConnection(endpoint, "page-a"),
+      engine: OBSCURA,
+      env: {},
+      executablePath: process.execPath,
+      mainEndpoint: async () => ({
+        endpoint: "ws://127.0.0.1:9222/devtools/browser/main",
+        userDataDir: "/unused",
+      }),
+      onError: () => undefined,
+      pathOptions: { dataHome: runtimeRoot, runtimeRoot },
+      recipeLauncher: launcher,
+      viewportConnector: idleViewportConnector,
+      workspacePath,
+    });
+    const main = await mainBroker.acquire("client-a", "main");
+    expect(launches).toHaveLength(0);
+    await main.close();
+    await mainBroker.close();
+
+    const connections: FakeCdpClient[] = [];
+    const chrome = writingLauncher(connections);
+    const chromeBroker = await ChromeBrowserBroker.create({
+      cdpConnector: chrome.connector,
+      env: {},
+      executablePath: process.execPath,
+      launcher: chrome.launcher,
+      onError: () => undefined,
+      pathOptions: { dataHome: runtimeRoot, runtimeRoot },
+      recipeLauncher: launcher,
+      workspacePath,
+    });
+    const isolated = await chromeBroker.acquire("client-a", "isolated-headless");
+    expect(chrome.launches).toBe(1);
+    expect(launches).toHaveLength(0);
+    await isolated.close();
+    await chromeBroker.close();
+  });
+});
+
+describe("remote mode", () => {
+  const REMOTE_ENDPOINT = "ws://127.0.0.1:9444/devtools/browser/remote";
+
+  test("attaches remote to the configured endpoint without a lease, downloads, owner metadata, engine or Browser.close", async () => {
+    const workspacePath = await temporaryDirectory("chrome-remote-workspace-");
+    const runtimeRoot = await temporaryDirectory("chrome-remote-runtime-");
+    const events: string[] = [];
+    const { launches, launcher } = recipeFixture(events);
+    const endpoints: string[] = [];
+    const connections: FakeCdpClient[] = [];
+    const broker = await ChromeBrowserBroker.create({
+      cdpConnector: async (endpoint) => {
+        endpoints.push(endpoint);
+        const connection = pageConnection(endpoint, `remote-page-${connections.length + 1}`);
+        connections.push(connection);
+        return connection;
+      },
+      cdpEndpoint: REMOTE_ENDPOINT,
+      engine: OBSCURA,
+      env: {},
+      executablePath: process.execPath,
+      onError: () => undefined,
+      pathOptions: { dataHome: runtimeRoot, runtimeRoot },
+      recipeLauncher: launcher,
+      viewportConnector: idleViewportConnector,
+      workspacePath,
+    });
+    const session = await broker.acquire("client-a", "remote");
+    expect(endpoints).toEqual([REMOTE_ENDPOINT]);
+    expect(launches.length).toBe(0);
+    expect(connections[0]?.commands.some((command) => command.method === "Browser.setDownloadBehavior")).toBe(
+      false,
+    );
+    const worker = await session.admit({ run: async () => session.workerConnection() });
+    expect(worker.downloadsPath).toBeUndefined();
+    expect(session.owner.snapshot().ownership).toBe("attached");
+    await expect(
+      session.admit({
+        run: () => {
+          session.authorizeOwnerClose("browser");
+          return Promise.resolve();
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: "CHROME_MCP_BROWSER_CLOSE_FORBIDDEN",
+      message: expect.stringContaining("remote mode is attached"),
+    });
+
+    connections[0]?.close();
+    const sameSession = await broker.acquire("client-a", "remote");
+    expect(sameSession.owner.ownerGeneration).toBe(2);
+    expect(endpoints).toEqual([REMOTE_ENDPOINT, REMOTE_ENDPOINT]);
+
+    await session.close();
+    await broker.close();
+    expect(
+      connections.flatMap((connection) => connection.commands).some((command) => command.method === "Browser.close"),
+    ).toBe(false);
+    expect(events).toEqual([]);
+    expect(await Bun.file(session.owner.paths.ownerMetadataPath).exists()).toBe(false);
+  });
+
+  test("resolves an http endpoint through /json/version before connecting", async () => {
+    const workspacePath = await temporaryDirectory("chrome-remote-http-workspace-");
+    const runtimeRoot = await temporaryDirectory("chrome-remote-http-runtime-");
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: () => Response.json({ webSocketDebuggerUrl: REMOTE_ENDPOINT }),
+    });
+    const endpoints: string[] = [];
+    const broker = await ChromeBrowserBroker.create({
+      cdpConnector: async (endpoint) => {
+        endpoints.push(endpoint);
+        return pageConnection(endpoint, "remote-http-page");
+      },
+      cdpEndpoint: `http://127.0.0.1:${server.port}/`,
+      env: {},
+      executablePath: process.execPath,
+      onError: () => undefined,
+      pathOptions: { dataHome: runtimeRoot, runtimeRoot },
+      viewportConnector: idleViewportConnector,
+      workspacePath,
+    });
+    try {
+      const session = await broker.acquire("client-a", "remote");
+      expect(endpoints).toEqual([REMOTE_ENDPOINT]);
+      await session.close();
+    } finally {
+      await broker.close();
+      await server.stop(true);
+    }
+  });
+
+  test("reports CHROME_MCP_REMOTE_UNAVAILABLE when the endpoint cannot be connected or initialized", async () => {
+    const workspacePath = await temporaryDirectory("chrome-remote-failure-workspace-");
+    const runtimeRoot = await temporaryDirectory("chrome-remote-failure-runtime-");
+    const make = (cdpConnector: NonNullable<ChromeBrowserBrokerOptions["cdpConnector"]>) =>
+      ChromeBrowserBroker.create({
+        cdpConnector,
+        cdpEndpoint: REMOTE_ENDPOINT,
+        env: {},
+        executablePath: process.execPath,
+        onError: () => undefined,
+        pathOptions: { dataHome: runtimeRoot, runtimeRoot },
+        viewportConnector: idleViewportConnector,
+        workspacePath,
+      });
+    const refused = await make(() => Promise.reject(new Error("connection refused")));
+    await expect(refused.acquire("client-a", "remote")).rejects.toMatchObject({
+      code: "CHROME_MCP_REMOTE_UNAVAILABLE",
+      message: `Could not connect to the CDP endpoint ${REMOTE_ENDPOINT}: connection refused`,
+    });
+    await refused.close();
+
+    const broken = await make(async (endpoint) => {
+      const connection = pageConnection(endpoint, "remote-page");
+      connection.command = () => Promise.reject(new Error("Target discovery failed"));
+      return connection;
+    });
+    await expect(broken.acquire("client-a", "remote")).rejects.toMatchObject({
+      code: "CHROME_MCP_REMOTE_UNAVAILABLE",
+      message:
+        "The CDP endpoint accepted the connection, but session initialization failed: Target discovery failed",
+    });
+    await broken.close();
+  });
+
+  test("redacts credentials and the query of the CDP endpoint in a connection failure", async () => {
+    const workspacePath = await temporaryDirectory("chrome-remote-redact-workspace-");
+    const runtimeRoot = await temporaryDirectory("chrome-remote-redact-runtime-");
+    const broker = await ChromeBrowserBroker.create({
+      cdpConnector: () => Promise.reject(new Error("connection refused")),
+      cdpEndpoint: "ws://user:secret@127.0.0.1:9222/devtools/browser/x?token=abc",
+      env: {},
+      executablePath: process.execPath,
+      onError: () => undefined,
+      pathOptions: { dataHome: runtimeRoot, runtimeRoot },
+      viewportConnector: idleViewportConnector,
+      workspacePath,
+    });
+    const rejection = await broker.acquire("client-a", "remote").then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect((rejection as Error).message).toBe(
+      "Could not connect to the CDP endpoint ws://***@127.0.0.1:9222/devtools/browser/x?***: connection refused",
+    );
+    await broker.close();
+  });
+
+  test("reports CHROME_MCP_REMOTE_UNAVAILABLE when the server has no CDP endpoint", async () => {
+    const workspacePath = await temporaryDirectory("chrome-remote-missing-workspace-");
+    const runtimeRoot = await temporaryDirectory("chrome-remote-missing-runtime-");
+    const broker = await ChromeBrowserBroker.create({
+      cdpConnector: async (endpoint) => pageConnection(endpoint, "page-a"),
+      env: {},
+      executablePath: process.execPath,
+      onError: () => undefined,
+      pathOptions: { dataHome: runtimeRoot, runtimeRoot },
+      workspacePath,
+    });
+    await expect(broker.acquire("client-a", "remote")).rejects.toMatchObject({
+      code: "CHROME_MCP_REMOTE_UNAVAILABLE",
+      message: 'The "remote" browser mode needs a CDP endpoint. Restart the server with --cdp-endpoint <url>',
+    });
+    await broker.close();
+  });
+});
+
+describe("recipe engine owner with a real engine process", () => {
+  const FAKE_ENGINE = fileURLToPath(new URL("./fake-cdp-engine.test-support.ts", import.meta.url));
+  const stubborn = {
+    name: "obscura",
+    args: [FAKE_ENGINE, "--port", "{port}", "--storage-dir", "{profileDir}", "--behavior", "ignore-close", "--spawn-child"],
+    headlessOnly: true,
+    startupTimeoutMs: 10_000,
+  };
+  const fastLauncher: RecipeBrowserLauncher = {
+    launch: (options) => launchRecipeBrowser({ ...options, closeGraceMs: 200 }),
+  };
+  const isRunning = (pid: number) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const readRecord = async (profileDir: string) =>
+    JSON.parse(await readFile(join(profileDir, "fake-engine.json"), "utf8")) as { childPid: number; pid: number };
+  const waitUntilGone = async (...pids: number[]) => {
+    for (let attempt = 0; attempt < 200 && pids.some(isRunning); attempt++) await Bun.sleep(25);
+  };
+
+  test("stops the engine process tree on close when Browser.close fails with the connection still open", async () => {
+    const workspacePath = await temporaryDirectory("chrome-recipe-fail-workspace-");
+    const runtimeRoot = await temporaryDirectory("chrome-recipe-fail-runtime-");
+    const broker = await ChromeBrowserBroker.create({
+      cdpConnector: async (endpoint) => {
+        const connection = pageConnection(endpoint, "page-1");
+        const command = connection.command;
+        connection.command = async (input) => {
+          if (input.method === "Browser.close") throw new Error("injected Browser.close failure");
+          return command(input);
+        };
+        return connection;
+      },
+      engine: stubborn,
+      env: {},
+      executablePath: process.execPath,
+      onError: () => undefined,
+      pathOptions: { dataHome: runtimeRoot, runtimeRoot },
+      recipeLauncher: fastLauncher,
+      // The PID fallback must not be what stops the engine: handle.close() has to run.
+      signalProcess: () => undefined,
+      viewportConnector: idleViewportConnector,
+      workspacePath,
+    });
+    const session = await broker.acquire("client-a", "isolated-headless");
+    const { childPid, pid } = await readRecord(session.owner.paths.userDataDir);
+    expect(isRunning(pid)).toBe(true);
+    expect(isRunning(childPid)).toBe(true);
+    try {
+      await session.close();
+      await broker.close();
+      await waitUntilGone(pid, childPid);
+      expect(isRunning(pid)).toBe(false);
+      expect(isRunning(childPid)).toBe(false);
+    } finally {
+      for (const leaked of [pid, childPid]) if (isRunning(leaked)) process.kill(leaked, "SIGKILL");
+    }
+  }, 20_000);
+
+  test("stops the process tree of an adopted engine that ignores Browser.close", async () => {
+    const workspacePath = await temporaryDirectory("chrome-recipe-adopt-real-workspace-");
+    const runtimeRoot = await temporaryDirectory("chrome-recipe-adopt-real-runtime-");
+    const endpoints: string[] = [];
+    const broker = await ChromeBrowserBroker.create({
+      cdpConnector: async (endpoint) => {
+        endpoints.push(endpoint);
+        return pageConnection(endpoint, "page-1", pid);
+      },
+      engine: stubborn,
+      env: {},
+      executablePath: process.execPath,
+      onError: () => undefined,
+      pathOptions: { dataHome: runtimeRoot, runtimeRoot },
+      recipeLauncher: fastLauncher,
+      viewportConnector: idleViewportConnector,
+      workspacePath,
+    });
+    const key = createOwnerKey("shared-headless", broker.workspaceHash, "x");
+    const paths = resolveChromeRuntimePaths(key, { dataHome: runtimeRoot, engineName: "obscura", runtimeRoot });
+    // The first owner ended without closing the engine: the process is alive and its metadata is not clean.
+    const first = await launchRecipeBrowser({
+      command: process.execPath,
+      engine: stubborn,
+      profileDir: paths.userDataDir,
+    });
+    const { childPid, pid } = await readRecord(paths.userDataDir);
+    try {
+      await writeBrowserOwnerMetadata(paths.ownerMetadataPath, {
+        browserPid: pid,
+        cleanShutdown: false,
+        endpoint: first.recipe.endpoint,
+        engine: "obscura",
+        enginePath: process.execPath,
+        mode: "shared-headless",
+        ownerGeneration: 1,
+        processStartIdentity: await currentProcessStartIdentity(pid),
+        profilePathHash: profilePathHash(paths.userDataDir),
+        updatedAt: new Date().toISOString(),
+      });
+      const started = Date.now();
+      const session = await broker.acquire("client-a", "shared-headless");
+      expect(endpoints).toEqual([first.recipe.endpoint]);
+      await session.close();
+      await broker.close();
+      expect(Date.now() - started).toBeLessThan(10_000);
+      await waitUntilGone(pid, childPid);
+      expect(isRunning(pid)).toBe(false);
+      expect(isRunning(childPid)).toBe(false);
+      expect(JSON.parse(await readFile(paths.ownerMetadataPath, "utf8"))).toMatchObject({ cleanShutdown: true });
+    } finally {
+      for (const leaked of [pid, childPid]) if (isRunning(leaked)) process.kill(leaked, "SIGKILL");
+      await first.close().catch(() => undefined);
+    }
+  }, 30_000);
+
+  test("does not stop the process tree of an adopted engine whose identity changed after the grace wait", async () => {
+    const workspacePath = await temporaryDirectory("chrome-recipe-reuse-workspace-");
+    const runtimeRoot = await temporaryDirectory("chrome-recipe-reuse-runtime-");
+    let closing = false;
+    let graceStartedAt: number | undefined;
+    let identityChanged = false;
+    // Reports the exact process until the close grace wait ends, then reports a different process (PID reuse).
+    const processIdentity: NonNullable<ChromeBrowserBrokerOptions["processIdentity"]> = async (pid, identity) => {
+      if (!closing) return probeProcessIdentity(pid, identity);
+      if (identityChanged) return "different";
+      graceStartedAt ??= Date.now();
+      if (Date.now() - graceStartedAt < RECIPE_CLOSE_GRACE_MS - 20) return "same";
+      // The probe that starts at the end of the grace period outlasts its deadline, so the wait fails with a timeout.
+      identityChanged = true;
+      await Bun.sleep(40);
+      return "same";
+    };
+    const broker = await ChromeBrowserBroker.create({
+      cdpConnector: async (endpoint) => pageConnection(endpoint, "page-1", pid),
+      engine: stubborn,
+      env: {},
+      executablePath: process.execPath,
+      onError: () => undefined,
+      pathOptions: { dataHome: runtimeRoot, runtimeRoot },
+      processIdentity,
+      recipeLauncher: fastLauncher,
+      viewportConnector: idleViewportConnector,
+      workspacePath,
+    });
+    const key = createOwnerKey("shared-headless", broker.workspaceHash, "x");
+    const paths = resolveChromeRuntimePaths(key, { dataHome: runtimeRoot, engineName: "obscura", runtimeRoot });
+    const first = await launchRecipeBrowser({
+      command: process.execPath,
+      engine: stubborn,
+      profileDir: paths.userDataDir,
+    });
+    const { childPid, pid } = await readRecord(paths.userDataDir);
+    try {
+      await writeBrowserOwnerMetadata(paths.ownerMetadataPath, {
+        browserPid: pid,
+        cleanShutdown: false,
+        endpoint: first.recipe.endpoint,
+        engine: "obscura",
+        enginePath: process.execPath,
+        mode: "shared-headless",
+        ownerGeneration: 1,
+        processStartIdentity: await currentProcessStartIdentity(pid),
+        profilePathHash: profilePathHash(paths.userDataDir),
+        updatedAt: new Date().toISOString(),
+      });
+      const session = await broker.acquire("client-a", "shared-headless");
+      closing = true;
+      await session.close();
+      await broker.close();
+      expect(identityChanged).toBe(true);
+      // The PID now belongs to another process as far as the owner can tell: it must not be signalled.
+      expect(isRunning(pid)).toBe(true);
+      expect(isRunning(childPid)).toBe(true);
+    } finally {
+      for (const leaked of [pid, childPid]) if (isRunning(leaked)) process.kill(leaked, "SIGKILL");
+      await first.close().catch(() => undefined);
+    }
+  }, 30_000);
 });

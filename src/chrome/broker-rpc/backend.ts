@@ -1,4 +1,5 @@
 import type { BrowserLaunchSettings } from "../runtime/browser-owner";
+import type { RecipeEngine } from "../runtime/engine-recipes";
 import type { PageViewportRequest, PageViewportState } from "../runtime/page-viewport";
 import type { PwaOperation, PwaResult } from "../runtime/pwa-controller";
 import type { ReactBrowserOperation, ReactOperationResult } from "../runtime/react-inspection-protocol";
@@ -107,6 +108,8 @@ export interface BrokerBackend {
 }
 
 export type ChromeBrokerBackendOptions = Readonly<{
+  cdpEndpoint?: string;
+  engine?: RecipeEngine;
   executablePath: string;
   runtimeRoot?: string;
   workspacePath: string;
@@ -322,6 +325,8 @@ export const createChromeBrokerBackend = async (
 ): Promise<BrokerBackend> => {
   let downloadPublisher: BrokerDownloadPublisher | undefined;
   const broker = await ChromeBrowserBroker.create({
+    ...(options.cdpEndpoint ? { cdpEndpoint: options.cdpEndpoint } : {}),
+    ...(options.engine ? { engine: options.engine } : {}),
     executablePath: options.executablePath,
     onDownloadFinished: async (input) => {
       const publisher = downloadPublisher;

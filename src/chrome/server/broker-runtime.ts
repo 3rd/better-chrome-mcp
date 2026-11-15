@@ -14,6 +14,7 @@ import type {
   PersistentMutationInput,
   PersistentMutationKind,
 } from "../runtime";
+import type { RecipeEngine } from "../runtime/engine-recipes";
 import type { PageViewportRequest } from "../runtime/page-viewport";
 import type { PwaOperation } from "../runtime/pwa-controller";
 import type { ReactBrowserOperation, ReactOperationResult } from "../runtime/react-inspection-protocol";
@@ -26,6 +27,8 @@ import type {
 import { type ChromeBrokerClient, connectChromeBroker, type RemoteBrowserSession } from "../broker-rpc";
 
 export type BrokerRuntimeOptions = Readonly<{
+  cdpEndpoint?: string;
+  engine?: RecipeEngine;
   executablePath: string;
   mainUserDataDir?: string;
   runtimeRoot?: string;

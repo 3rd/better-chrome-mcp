@@ -70,3 +70,25 @@ export const resolveChromeExecutable = async (options: ChromeExecutableOptions =
     "Chrome was not found. Install Google Chrome or set --executable-path (CHROME_MCP_EXECUTABLE_PATH).",
   );
 };
+
+export const resolveEngineExecutable = async (
+  engineName: string,
+  path: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+) => {
+  if (!path) {
+    throw new Error(
+      `The ${engineName} engine needs its program path: pass --executable-path <path>, or set "command" for it in --engine-config`,
+    );
+  }
+
+  const resolved = Bun.which(path, { PATH: env.PATH }) ?? resolve(path);
+
+  try {
+    await access(resolved, constants.X_OK);
+  } catch {
+    throw new Error(`Engine "${engineName}" program is not accessible: ${resolved}`);
+  }
+
+  return resolved;
+};

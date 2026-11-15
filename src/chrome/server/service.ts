@@ -130,6 +130,7 @@ import {
   PERSISTENT_MUTATION_MAX_ENTRY_BYTES,
   PERSISTENT_MUTATION_MAX_TOTAL_BYTES,
 } from "../runtime";
+import type { RecipeEngine } from "../runtime/engine-recipes";
 import {
   assertMatchingNativeDeviceScaleFactor,
   assertNativeDeviceScaleFactor,
@@ -199,11 +200,13 @@ const scheduleIdleShutdownTimer: IdleShutdownScheduler = (delayMs, fire) => {
 
 export type ChromeServiceOptions = Readonly<{
   artifactStore?: ArtifactStore;
+  cdpEndpoint?: string;
   capture?: Readonly<{
     ffmpegExecutable?: string;
     ffmpegProcesses?: FfmpegProcessFactory;
     tracingResolver?: PlaywrightTracingResolver;
   }>;
+  engine?: RecipeEngine;
   executablePath?: string;
   executionKernel?: ChromeExecutionKernel;
   idleShutdownMs?: number;
@@ -2908,6 +2911,8 @@ export const createChromeService = async (options: ChromeServiceOptions = {}): P
       );
     }
     runtime = BrokerRuntime.create({
+      ...(options.cdpEndpoint ? { cdpEndpoint: options.cdpEndpoint } : {}),
+      ...(options.engine ? { engine: options.engine } : {}),
       executablePath: options.executablePath,
       mainUserDataDir: options.mainUserDataDir,
       workspacePath: options.workspacePath,

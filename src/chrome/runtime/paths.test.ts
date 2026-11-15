@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
   createOwnerKey,
   resolveChromeRuntimePaths,
@@ -64,5 +64,22 @@ describe("Chrome runtime paths", () => {
     expect(resolveMainChromeUserDataDir({ HOME: "C:/Users/test", LOCALAPPDATA: "C:/Local" }, "win32")).toBe(
       "C:/Local/Google/Chrome/User Data",
     );
+  });
+  test("scopes recipe engine profiles by engine name and keeps Chrome paths unchanged", () => {
+    const h = "a".repeat(64);
+    const options = { dataHome: join("data"), home: join("home"), runtimeRoot: join("run") };
+    const key = createOwnerKey("shared-headless", h, "a");
+    const isoKey = createOwnerKey("isolated-headless", h, "a");
+    const chrome = resolveChromeRuntimePaths(key, options);
+    const obscura = resolveChromeRuntimePaths(key, { ...options, engineName: "obscura" });
+    expect(chrome.profileRoot).toBe(join("data", "chrome-mcp", "profiles", h, "shared-headless"));
+    expect(obscura.profileRoot).toBe(join("data", "chrome-mcp", "profiles", "obscura", h, "shared-headless"));
+    const chromeIso = resolveChromeRuntimePaths(isoKey, options);
+    const obscuraIso = resolveChromeRuntimePaths(isoKey, { ...options, engineName: "obscura" });
+    expect(obscuraIso.profileRoot).toBe(
+      join(dirname(chromeIso.profileRoot), "obscura", basename(chromeIso.profileRoot)),
+    );
+    expect(obscura.downloadsPath).toBe(chrome.downloadsPath);
+    expect(obscura.runtimeRoot).toBe(chrome.runtimeRoot);
   });
 });

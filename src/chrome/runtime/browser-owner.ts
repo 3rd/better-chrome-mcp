@@ -9,8 +9,10 @@ import { type AdmissionOperation, OwnerAdmissionQueue } from "./admission";
 import {
   assertChromeExecutable,
   type BrowserLauncher,
+  createLaunchDirectories,
   diagnoseMainChromeConnectFailure,
   discoverMainChromeEndpoint,
+  HEADLESS_VIEWPORT,
   type LaunchedBrowserHandle,
   loadPlaywrightBrowserLauncher,
   MAIN_CHROME_CONNECT_TIMEOUT_MS,
@@ -20,6 +22,9 @@ import {
 } from "./browser-launcher";
 import { type CdpClient, CdpConnection, cdpRecord } from "./cdp-connection";
 import { CdpRelay } from "./cdp-relay";
+import { assertEngineSupportsMode, type RecipeEngine } from "./engine-recipes";
+import { resolveRemoteCdpEndpoint } from "./devtools-endpoint";
+import { redactEndpointUrl } from "./endpoint-redaction";
 import { ChromeRuntimeError } from "./errors";
 import {
   BoundedEventJournal,
@@ -33,6 +38,7 @@ import {
   assertMatchingNativeDeviceScaleFactor,
   assertNativeDeviceScaleFactor,
   browserOwnership,
+  isAttachedMode,
   isHeadlessMode,
   isIsolatedMode,
   isSharedMode,
@@ -74,6 +80,12 @@ import { ProfileLease, type ProfileLeaseOptions, profilePathHash } from "./profi
 import { PWA_INSTALL_RECEIPT_FILE, PwaController, readPwaReceipts } from "./pwa-controller";
 import { ReactInspectionManager } from "./react-inspection-manager";
 import {
+  RECIPE_CLOSE_GRACE_MS,
+  type RecipeBrowserLauncher,
+  recipeBrowserLauncher,
+  stopRecipeProcessTreeByPid,
+} from "./recipe-launcher";
+import {
   ChromeTargetObserver,
   discoverBrowserProcessId,
   discoverChromeVersion,
@@ -106,8 +118,12 @@ export type BrowserLaunchSettings = Readonly<{
   nativeDeviceScaleFactor?: number;
 }>;
 
+export type ViewportConnector = (endpoint: string) => ReturnType<typeof connectPageViewportController>;
+
 export type BrowserOwnerOptions = Readonly<{
   cdpConnector?: CdpConnector;
+  cdpEndpoint?: string;
+  engine?: RecipeEngine;
   env?: NodeJS.ProcessEnv;
   executablePath: string;
   generationHint?: number;
@@ -122,10 +138,12 @@ export type BrowserOwnerOptions = Readonly<{
   paths: ChromeRuntimePaths;
   processExitWaitMs?: number;
   processIdentity?: ProcessIdentityProbe;
+  recipeLauncher?: RecipeBrowserLauncher;
   signalProcess?: (pid: number, signal: NodeJS.Signals) => void;
   processStartIdentity?: (pid: number) => Promise<string>;
   shutdownGraceMs?: number;
   transferredProfileLease?: ProfileLease;
+  viewportConnector?: ViewportConnector;
 }>;
 
 export type BrowserOwnerSnapshot = Readonly<{
@@ -146,6 +164,7 @@ export type BrowserOwnerCloseResource = "browser" | "default-context";
 
 type OpenedBrowser = Readonly<{
   adopted: boolean;
+  browserPid?: number;
   connection: CdpClient;
   generation: number;
   launchHandle?: LaunchedBrowserHandle;
@@ -198,7 +217,23 @@ const closeAdoptedBrowser = async (
   try {
     await connection.send("Browser.close", {}, undefined, 5000);
   } catch (error: unknown) {
-    if (!connection.closed) throw error;
+    if (!connection.closed && !metadata.engine) throw error;
+  }
+  if (metadata.engine) {
+    // A recipe engine may acknowledge Browser.close without exiting: after a grace period, stop its process tree.
+    const processIdentity = options.processIdentity ?? probeProcessIdentity;
+    try {
+      await waitForExactProcessExit(metadata.browserPid, metadata.processStartIdentity, {
+        processIdentity,
+        timeoutMs: RECIPE_CLOSE_GRACE_MS,
+      });
+      return;
+    } catch (error: unknown) {
+      if (metadata.browserPid === process.pid) throw error;
+      if ((await processIdentity(metadata.browserPid, metadata.processStartIdentity)) === "same") {
+        await stopRecipeProcessTreeByPid(metadata.browserPid);
+      }
+    }
   }
   await waitForExactProcessExit(metadata.browserPid, metadata.processStartIdentity, {
     processIdentity: options.processIdentity,
@@ -226,6 +261,10 @@ const closeLaunchedBrowser = async (
 ): Promise<void> => {
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
+    if (handle.recipe) {
+      // handle.close() stops the process tree whether or not the engine honored Browser.close.
+      await connection.send("Browser.close", {}, undefined, 5000).catch(() => undefined);
+    }
     await Promise.race([
       handle.close(),
       new Promise<never>((_resolve, reject) => {
@@ -287,6 +326,12 @@ const tryAdoptSharedBrowser = async (
 ): Promise<CdpClient | undefined> => {
   if (!isSharedMode(options.key.mode) || !prior || prior.cleanShutdown) return undefined;
   if (
+    prior.engine !== options.engine?.name ||
+    prior.enginePath !== (options.engine ? options.executablePath : undefined)
+  ) {
+    return undefined;
+  }
+  if (
     prior.mode !== options.key.mode ||
     prior.profilePathHash !== profilePathHash(options.paths.userDataDir)
   ) {
@@ -347,6 +392,23 @@ const openBrowser = async (options: BrowserOwnerOptions): Promise<OpenedBrowser>
       throw await diagnoseMainChromeConnectFailure(endpoint, userDataDir, error);
     }
   }
+  if (options.key.mode === "remote") {
+    const cdpEndpoint = options.cdpEndpoint ?? "";
+    const endpoint = await resolveRemoteCdpEndpoint(cdpEndpoint);
+    try {
+      return Object.freeze({
+        adopted: false,
+        connection: await connector(endpoint),
+        generation: options.generationHint ?? 1,
+      });
+    } catch (error: unknown) {
+      throw new ChromeRuntimeError(
+        "CHROME_MCP_REMOTE_UNAVAILABLE",
+        `Could not connect to the CDP endpoint ${redactEndpointUrl(cdpEndpoint)}: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      );
+    }
+  }
 
   let lease = options.transferredProfileLease;
   let launchHandle: LaunchedBrowserHandle | undefined;
@@ -368,6 +430,28 @@ const openBrowser = async (options: BrowserOwnerOptions): Promise<OpenedBrowser>
         adopted: true,
         connection: adoptedConnection,
         generation,
+        ...(options.engine && prior ? { browserPid: prior.browserPid } : {}),
+        ...(lease ? { profileLease: lease } : {}),
+      });
+    }
+
+    if (options.engine) {
+      await assertChromeExecutable(options.executablePath);
+      await createLaunchDirectories(options.paths.userDataDir, options.paths.downloadsPath);
+      const recipeLauncher = options.recipeLauncher ?? recipeBrowserLauncher;
+      const recipeHandle = await recipeLauncher.launch({
+        command: options.executablePath,
+        engine: options.engine,
+        profileDir: options.paths.userDataDir,
+      });
+      launchHandle = recipeHandle;
+      connection = await connector(recipeHandle.recipe.endpoint);
+      return Object.freeze({
+        adopted: false,
+        browserPid: recipeHandle.recipe.browserPid,
+        connection,
+        generation,
+        launchHandle,
         ...(lease ? { profileLease: lease } : {}),
       });
     }
@@ -452,12 +536,16 @@ export class BrowserOwner {
   #adopted: boolean;
   #activeConnectionId: string | undefined;
   #admittedCalls = 0;
+  #browserPid: number | undefined;
   #chromeMajorVersion: number | undefined;
   #chromeProduct: string | undefined;
   #clients = new Set<string>();
   #closed = false;
   #closePromise: Promise<void> | undefined;
   #closing = false;
+  #clientViewportTargets = new Set<string>();
+  #defaultViewportUnavailable = false;
+  #defaultViewports = new Map<string, Promise<void>>();
   #launchHandle: LaunchedBrowserHandle | undefined;
   #viewportConnection: ReturnType<typeof connectPageViewportController> | undefined;
   #workerScope: ReturnType<CdpRelay["createScope"]> | undefined;
@@ -474,6 +562,7 @@ export class BrowserOwner {
     this.connection = opened.connection;
     this.ownerGeneration = opened.generation;
     this.#adopted = opened.adopted;
+    this.#browserPid = opened.browserPid;
     this.#launchHandle = opened.launchHandle;
     this.#profileLease = opened.profileLease;
     this.#onError = options.onError;
@@ -500,7 +589,7 @@ export class BrowserOwner {
       },
       browserMode: this.key.mode,
       connection: opened.connection,
-      ...(this.key.mode === "main" ? {} : { downloadsPath: this.paths.downloadsPath }),
+      ...(isAttachedMode(this.key.mode) ? {} : { downloadsPath: this.paths.downloadsPath }),
       journal: this.journal,
       modals: this.modals,
       mutations: this.mutations,
@@ -511,6 +600,7 @@ export class BrowserOwner {
         if (record) this.selections.onTargetClosed(record);
         this.react.closeTarget(targetId).catch(this.#onError);
       },
+      ...(options.engine ? { onTargetReady: (targetId: string) => this.#applyDefaultViewport(targetId) } : {}),
       registry: this.registry,
     });
     opened.profileLease?.waitForFailure().then((error) => {
@@ -531,8 +621,9 @@ export class BrowserOwner {
     const owner = new BrowserOwner(options, opened);
     try {
       await owner.observer.start();
-      if (options.key.mode !== "main") await owner.observer.enableOwnedDownloads(options.paths.downloadsPath);
+      if (!isAttachedMode(options.key.mode)) await owner.observer.enableOwnedDownloads(options.paths.downloadsPath);
       await owner.observer.ensurePage();
+      await Promise.all(owner.#defaultViewports.values());
       await owner.#recordOpenMetadata();
 
       return owner;
@@ -547,6 +638,12 @@ export class BrowserOwner {
         failure = new ChromeRuntimeError(
           error instanceof ChromeRuntimeError ? error.code : "CHROME_MCP_MAIN_UNAVAILABLE",
           `Chrome accepted the main debugging connection, but session initialization failed: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
+        );
+      } else if (options.key.mode === "remote") {
+        failure = new ChromeRuntimeError(
+          error instanceof ChromeRuntimeError ? error.code : "CHROME_MCP_REMOTE_UNAVAILABLE",
+          `The CDP endpoint accepted the connection, but session initialization failed: ${error instanceof Error ? error.message : String(error)}`,
           { cause: error },
         );
       }
@@ -591,6 +688,16 @@ export class BrowserOwner {
 
   async pageViewport(request: PageViewportRequest, signal: AbortSignal) {
     signal.throwIfAborted();
+    if (request.operation === "set") {
+      this.#clientViewportTargets.add(request.targetId);
+      await this.#defaultViewports.get(request.targetId);
+      signal.throwIfAborted();
+    }
+
+    return this.#runPageViewport(request, signal);
+  }
+
+  async #runPageViewport(request: PageViewportRequest, signal: AbortSignal) {
     const targetClosed = new AbortController();
     const remove = this.connection.on("Target.targetDestroyed", (params) => {
       if (cdpRecord(params)?.targetId === request.targetId) {
@@ -612,7 +719,9 @@ export class BrowserOwner {
 
       let controller = this.#launchHandle?.pageViewport;
       if (!controller) {
-        this.#viewportConnection ??= connectPageViewportController(this.relay.endpoint);
+        this.#viewportConnection ??= (this.#options.viewportConnector ?? connectPageViewportController)(
+          this.relay.endpoint,
+        );
         try {
           const viewportConnection = await this.#viewportConnection;
           controller = viewportConnection.pageViewport;
@@ -626,6 +735,24 @@ export class BrowserOwner {
     } finally {
       remove();
     }
+  }
+
+  #applyDefaultViewport(targetId: string): void {
+    if (this.#defaultViewportUnavailable || this.#clientViewportTargets.has(targetId)) return;
+    const signal = AbortSignal.timeout(5000);
+    const apply = async () => {
+      try {
+        const stored = await this.#runPageViewport({ operation: "read", targetId }, signal);
+        if (stored || this.#clientViewportTargets.has(targetId)) return;
+        await this.#runPageViewport({ operation: "set", targetId, viewport: HEADLESS_VIEWPORT }, signal);
+      } catch {
+        this.#defaultViewportUnavailable = true;
+      }
+    };
+    const pending = apply().finally(() => {
+      if (this.#defaultViewports.get(targetId) === pending) this.#defaultViewports.delete(targetId);
+    });
+    this.#defaultViewports.set(targetId, pending);
   }
 
   async #disconnectViewport() {
@@ -691,10 +818,12 @@ export class BrowserOwner {
     }
     const resourceName = resource === "browser" ? "browser" : "broker-owned default context";
     const remediation = "Close pages or additional contexts created by this call instead";
-    if (this.key.mode === "main") {
+    if (isAttachedMode(this.key.mode)) {
       throw new ChromeRuntimeError(
         "CHROME_MCP_BROWSER_CLOSE_FORBIDDEN",
-        `Cannot close the ${resourceName}: main mode belongs to the user. ${remediation}`,
+        this.key.mode === "remote" ?
+          `Cannot close the ${resourceName}: remote mode is attached to a browser this server did not start. ${remediation}`
+        : `Cannot close the ${resourceName}: main mode belongs to the user. ${remediation}`,
       );
     }
 
@@ -819,7 +948,7 @@ export class BrowserOwner {
 
   enableOwnedDownloads(clientId: string): Promise<void> {
     this.#requireClient(clientId);
-    if (this.key.mode === "main") return Promise.resolve();
+    if (isAttachedMode(this.key.mode)) return Promise.resolve();
     return this.observer.enableOwnedDownloads(this.paths.downloadsPath);
   }
 
@@ -996,7 +1125,7 @@ export class BrowserOwner {
     this.mutations.stop();
     this.relay.close();
     let browserClose: Promise<unknown> = Promise.resolve();
-    if (this.key.mode === "main") {
+    if (isAttachedMode(this.key.mode)) {
       browserClose = Promise.resolve().then(() => this.connection.close());
     } else if (this.#launchHandle) {
       browserClose = closeLaunchedBrowser(this.#launchHandle, this.connection, this.#metadata, this.#options);
@@ -1039,7 +1168,7 @@ export class BrowserOwner {
   }
 
   async #recordCleanShutdown(): Promise<void> {
-    if (this.key.mode === "main") return;
+    if (isAttachedMode(this.key.mode)) return;
     if (isIsolatedMode(this.key.mode)) {
       await rm(this.paths.profileRoot, { force: true, recursive: true });
       return;
@@ -1066,8 +1195,8 @@ export class BrowserOwner {
     const version = await discoverChromeVersion(this.connection);
     this.#chromeProduct = version.product;
     this.#chromeMajorVersion = version.major;
-    if (this.key.mode === "main") return;
-    const browserPid = await discoverBrowserProcessId(this.connection);
+    if (isAttachedMode(this.key.mode)) return;
+    const browserPid = this.#browserPid ?? (await discoverBrowserProcessId(this.connection));
     if (!browserPid) {
       throw new Error("Chrome did not report its browser process ID through SystemInfo.getProcessInfo");
     }
@@ -1075,6 +1204,9 @@ export class BrowserOwner {
       browserPid,
       cleanShutdown: false,
       endpoint: this.connection.endpoint,
+      ...(this.#options.engine ?
+        { engine: this.#options.engine.name, enginePath: this.#options.executablePath }
+      : {}),
       mode: this.key.mode,
       ownerGeneration: this.ownerGeneration,
       processStartIdentity: await (this.#options.processStartIdentity ?? currentProcessStartIdentity)(
@@ -1119,6 +1251,8 @@ export class BrowserOwner {
 
 export type ChromeBrowserBrokerOptions = Readonly<{
   cdpConnector?: CdpConnector;
+  cdpEndpoint?: string;
+  engine?: RecipeEngine;
   env?: NodeJS.ProcessEnv;
   executablePath: string;
   launcher?: BrowserLauncher;
@@ -1129,9 +1263,11 @@ export type ChromeBrowserBrokerOptions = Readonly<{
   pathOptions?: ChromeRuntimePathOptions;
   processExitWaitMs?: number;
   processIdentity?: ProcessIdentityProbe;
+  recipeLauncher?: RecipeBrowserLauncher;
   signalProcess?: BrowserOwnerOptions["signalProcess"];
   processStartIdentity?: (pid: number) => Promise<string>;
   shutdownGraceMs?: number;
+  viewportConnector?: ViewportConnector;
   workspacePath: string;
 }>;
 
@@ -1318,7 +1454,7 @@ export class BrowserClientSession {
     target: GenerationTargetId;
   }> {
     return Object.freeze({
-      ...(this.owner.key.mode === "main" ? {} : { downloadsPath: this.owner.paths.downloadsPath }),
+      ...(isAttachedMode(this.owner.key.mode) ? {} : { downloadsPath: this.owner.paths.downloadsPath }),
       ...this.owner.getWorkerEndpoints(),
       ownerGeneration: this.owner.ownerGeneration,
       target: this.selectedTarget(),
@@ -1387,7 +1523,14 @@ export class ChromeBrowserBroker {
       throw new ChromeRuntimeError("CHROME_MCP_OWNER_CLOSED", "Chrome browser broker is closed");
     }
     const mode = parseBrowserMode(modeValue);
+    if (mode === "remote" && !this.#options.cdpEndpoint) {
+      throw new ChromeRuntimeError(
+        "CHROME_MCP_REMOTE_UNAVAILABLE",
+        'The "remote" browser mode needs a CDP endpoint. Restart the server with --cdp-endpoint <url>',
+      );
+    }
     assertNativeDeviceScaleFactor(mode, launch.nativeDeviceScaleFactor);
+    assertEngineSupportsMode(this.#options.engine, mode);
     const key = createOwnerKey(mode, this.workspaceHash, connectionId);
     const sessionKey = `${key.id}\u0000${connectionId}`;
     const existingSession = this.#sessions.get(sessionKey);
@@ -1637,7 +1780,7 @@ export class ChromeBrowserBroker {
       }
       try {
         let owner = await entry.promise;
-        if (owner.key.mode !== "main") continue;
+        if (!isAttachedMode(owner.key.mode)) continue;
         if (owner.disconnected) owner = await this.#recoverOwner(owner);
         await this.#drainCleanupTombstones(owner);
       } catch (error: unknown) {
@@ -1679,8 +1822,10 @@ export class ChromeBrowserBroker {
   ): Promise<BrowserOwner> {
     const env = this.#options.env ?? process.env;
     const runtimeRoot = this.#options.pathOptions?.runtimeRoot ?? getMcpRuntimeDir(env);
+    const engine = !isAttachedMode(key.mode) ? this.#options.engine : undefined;
     const paths = resolveChromeRuntimePaths(key, {
       dataHome: this.#options.pathOptions?.dataHome ?? env.XDG_DATA_HOME,
+      ...(engine ? { engineName: engine.name } : {}),
       home: this.#options.pathOptions?.home ?? env.HOME,
       runtimeRoot,
     });
@@ -1688,6 +1833,8 @@ export class ChromeBrowserBroker {
     const generationHint = (this.#generations.get(key.id) ?? 0) + 1;
     const owner = await BrowserOwner.create({
       cdpConnector: this.#options.cdpConnector,
+      ...(key.mode === "remote" ? { cdpEndpoint: this.#options.cdpEndpoint } : {}),
+      engine,
       env,
       executablePath: this.#options.executablePath,
       generationHint,
@@ -1701,11 +1848,13 @@ export class ChromeBrowserBroker {
       paths,
       processExitWaitMs: this.#options.processExitWaitMs,
       processIdentity: this.#options.processIdentity,
+      recipeLauncher: this.#options.recipeLauncher,
       signalProcess: this.#options.signalProcess,
       processStartIdentity: this.#options.processStartIdentity,
       shutdownGraceMs: this.#options.shutdownGraceMs,
       nativeDeviceScaleFactor: launch.nativeDeviceScaleFactor,
       transferredProfileLease: launch.transferredProfileLease,
+      viewportConnector: this.#options.viewportConnector,
     });
     this.#generations.set(key.id, owner.ownerGeneration);
     return owner;
