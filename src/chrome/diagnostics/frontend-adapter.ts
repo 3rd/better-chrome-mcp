@@ -86,6 +86,27 @@ const cachedBundleExists = async (path: string): Promise<boolean> => {
   }
 };
 
+export const FRONTEND_MCP_ENTRYPOINT_FILTER = /[\\/]mcp[\\/]mcp\.ts$/;
+
+export const isFrontendMcpEntrypoint = (path: string) => FRONTEND_MCP_ENTRYPOINT_FILTER.test(path);
+
+export const isFrontendLocalesImporter = (importer: string) =>
+  importer.replaceAll("\\", "/").endsWith("/front_end/core/i18n/i18nImpl.ts");
+
+export const describeFrontendBundleFailure = (error: unknown) => {
+  const base = error instanceof Error ? error.message : String(error);
+  const errors = isRecord(error) && Array.isArray(error.errors) ? error.errors : [];
+  const details = errors
+    .map((item) => (isRecord(item) && typeof item.message === "string" ? item.message : String(item)))
+    .filter(Boolean);
+  return new Error(
+    details.length > 0 ?
+      `Unable to bundle Chrome DevTools Frontend: ${base}: ${details.join("; ")}`
+    : `Unable to bundle Chrome DevTools Frontend: ${base}`,
+    { cause: error },
+  );
+};
+
 const buildFrontendBundle = async (destination: string, kind: "heap" | "trace") => {
   const entrypoint = fileURLToPath(import.meta.resolve("chrome-devtools-frontend/mcp/mcp.ts"));
   const result = await Bun.build({
@@ -97,7 +118,7 @@ const buildFrontendBundle = async (destination: string, kind: "heap" | "trace") 
       {
         name: "chrome-devtools-frontend-generated-locales",
         setup(build) {
-          build.onLoad({ filter: /\/mcp\/mcp\.ts$/ }, () => ({
+          build.onLoad({ filter: FRONTEND_MCP_ENTRYPOINT_FILTER }, () => ({
             contents:
               kind === "heap" ?
                 'export * as HeapSnapshotWorker from "../front_end/entrypoints/heap_snapshot_worker/heap_snapshot_worker.js";'
@@ -110,8 +131,8 @@ const buildFrontendBundle = async (destination: string, kind: "heap" | "trace") 
                 ].join("\n"),
             loader: "ts",
           }));
-          build.onResolve({ filter: /\/locales\.js$/ }, (args) => {
-            if (args.path !== "./locales.js" || !args.importer.endsWith("/front_end/core/i18n/i18nImpl.ts")) {
+          build.onResolve({ filter: /[\\/]locales\.js$/ }, (args) => {
+            if (args.path !== "./locales.js" || !isFrontendLocalesImporter(args.importer)) {
               return;
             }
             return { namespace: "chrome-devtools-locales", path: args.path };
@@ -124,6 +145,8 @@ const buildFrontendBundle = async (destination: string, kind: "heap" | "trace") 
       },
     ],
     target: "bun",
+  }).catch((error: unknown) => {
+    throw describeFrontendBundleFailure(error);
   });
   if (!result.success) {
     const detail = result.logs.map((log) => log.message).join("; ");
