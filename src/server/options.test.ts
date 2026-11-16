@@ -34,3 +34,44 @@ test("rejects a React tools mode other than auto, on, or off", () => {
 test("rejects unknown startup options", () => {
   expect(() => parseServerOptions(["--unknown"])).toThrow();
 });
+
+test("resolves --engine-config from the current directory and normalizes --cdp-endpoint", () => {
+  expect(
+    parseServerOptions([
+      "--engine",
+      "obscura",
+      "--engine-config",
+      "cfg/engines.json",
+      "--cdp-endpoint",
+      "http://127.0.0.1:9222",
+    ]),
+  ).toMatchObject({
+    engine: "obscura",
+    engineConfigPath: resolve("cfg/engines.json"),
+    cdpEndpoint: "http://127.0.0.1:9222/",
+  });
+  expect(parseServerOptions(["--cdp-endpoint", "http://host:9222/cdp"]).cdpEndpoint).toBe("http://host:9222/cdp");
+});
+
+test("rejects a CDP endpoint that is not an http(s) or ws(s) URL", () => {
+  expect(() => parseServerOptions(["--cdp-endpoint", "file:///x"])).toThrow(
+    '--cdp-endpoint must be an http(s):// or ws(s):// URL; received "file:///x"',
+  );
+  expect(() => parseServerOptions(["--cdp-endpoint", "not a url"])).toThrow("--cdp-endpoint must be");
+});
+
+test("echoes an invalid --react value verbatim", () => {
+  expect(() => parseServerOptions(["--react", "bogus"])).toThrow('received "bogus"');
+});
+
+test("redacts credentials and query from an invalid CDP endpoint in the error", () => {
+  let message = "";
+  try {
+    parseServerOptions(["--cdp-endpoint", "ftp://user:pw@host/?token=x"]);
+  } catch (error) {
+    message = (error as Error).message;
+  }
+  expect(message).toContain("--cdp-endpoint must be");
+  expect(message).not.toContain("pw");
+  expect(message).not.toContain("token=x");
+});

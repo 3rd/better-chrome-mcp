@@ -85,10 +85,18 @@ describe("Chrome MCP public contracts", () => {
       "shared",
       "shared-headless",
       "main",
+      "remote",
     ] as const) {
       expect(browserModeSchema.parse(mode)).toBe(mode);
     }
     expect(() => browserModeSchema.parse("headless")).toThrow();
+  });
+
+  test("accepts remote without a browserInstanceId and rejects one with it", () => {
+    expect(runPlaywrightInputSchema.safeParse({ code: "return 1", browser: "remote" }).success).toBe(true);
+    expect(
+      runPlaywrightInputSchema.safeParse({ code: "return 1", browser: "remote", browserInstanceId: "a" }).success,
+    ).toBe(false);
   });
 
   test("reuses direct React lookup contracts while keeping snapshot refs public-only", () => {

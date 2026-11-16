@@ -221,10 +221,14 @@ export const waitForDevToolsEndpoint = async (userDataDir: string, timeoutMs = 1
   }
 };
 
-export const prepareLaunchProfile = async (userDataDir: string, downloadsPath: string) => {
+export const createLaunchDirectories = async (userDataDir: string, downloadsPath: string) => {
   await mkdir(dirname(userDataDir), { recursive: true, mode: 0o700 });
   await mkdir(userDataDir, { recursive: true, mode: 0o700 });
   await mkdir(downloadsPath, { recursive: true, mode: 0o700 });
+};
+
+export const prepareLaunchProfile = async (userDataDir: string, downloadsPath: string) => {
+  await createLaunchDirectories(userDataDir, downloadsPath);
 
   const profileDirectory = join(userDataDir, "Default");
   const preferencesPath = join(profileDirectory, "Preferences");
@@ -327,6 +331,7 @@ export const modeLaunchOptions = ({
   nativeDeviceScaleFactor,
 }: ModeLaunchOptions): LaunchChromeOptions => {
   if (mode === "main") throw new Error("Main Chrome is attach-only");
+  if (mode === "remote") throw new Error("remote mode is attach-only");
 
   assertNativeDeviceScaleFactor(mode, nativeDeviceScaleFactor);
   const isHeadless = isHeadlessMode(mode);

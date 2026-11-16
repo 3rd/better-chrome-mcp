@@ -98,4 +98,48 @@ describe("Chrome owner metadata", () => {
       code: "CHROME_MCP_INVALID_PROFILE_METADATA",
     });
   });
+  test("round trips a recipe owner's engine name and command path and keeps Chrome's shape", async () => {
+    const paths = await fixture();
+    const base = {
+      browserPid: 123,
+      cleanShutdown: false,
+      endpoint: "ws://127.0.0.1:9222/devtools/browser/current",
+      mode: "shared-headless" as const,
+      ownerGeneration: 2,
+      processStartIdentity: "linux:10",
+      profilePathHash: "b".repeat(64),
+      updatedAt: new Date(1000).toISOString(),
+    };
+    await writeBrowserOwnerMetadata(paths.owner, { ...base, engine: "obscura", enginePath: "/engines/obscura" });
+    expect(await readBrowserOwnerMetadata(paths.owner)).toMatchObject({
+      engine: "obscura",
+      enginePath: "/engines/obscura",
+    });
+    await writeBrowserOwnerMetadata(paths.owner, base);
+    const keys = Object.keys(JSON.parse(await readFile(paths.owner, "utf8")));
+    expect(keys).not.toContain("engine");
+    expect(keys).not.toContain("enginePath");
+    expect(Object.keys((await readBrowserOwnerMetadata(paths.owner)) ?? {})).not.toContain("engine");
+  });
+
+  test("rejects owner metadata with only one of engine and enginePath", async () => {
+    const paths = await fixture();
+    await writeFile(
+      paths.owner,
+      JSON.stringify({
+        browserPid: 123,
+        cleanShutdown: false,
+        endpoint: "ws://127.0.0.1:9222/devtools/browser/current",
+        engine: "obscura",
+        mode: "shared-headless",
+        ownerGeneration: 2,
+        processStartIdentity: "linux:10",
+        profilePathHash: "b".repeat(64),
+        updatedAt: new Date(1000).toISOString(),
+      }),
+    );
+    await expect(readBrowserOwnerMetadata(paths.owner)).rejects.toMatchObject({
+      code: "CHROME_MCP_INVALID_PROFILE_METADATA",
+    });
+  });
 });

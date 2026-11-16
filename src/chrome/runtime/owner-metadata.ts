@@ -6,6 +6,7 @@ import type { BrowserMode, SharedBrowserMode } from "./modes";
 import { isNodeError } from "../../platform/node-errors";
 import { isRecord } from "../../platform/records";
 import { isBrowserMode } from "../browser-modes";
+import { ENGINE_NAME_PATTERN } from "./engine-recipes";
 import { ChromeRuntimeError } from "./errors";
 import { isSharedMode, parseBrowserMode } from "./modes";
 
@@ -20,6 +21,8 @@ export type BrowserOwnerMetadata = Readonly<{
   browserPid: number;
   cleanShutdown: boolean;
   endpoint: string;
+  engine?: string;
+  enginePath?: string;
   mode: BrowserMode;
   ownerGeneration: number;
   processStartIdentity: string;
@@ -118,7 +121,11 @@ export const readBrowserOwnerMetadata = async (path: string): Promise<BrowserOwn
       "processStartIdentity",
       "profilePathHash",
       "updatedAt",
+      ...(value.engine !== undefined || value.enginePath !== undefined ? ["engine", "enginePath"] : []),
     ]) ||
+    (value.engine !== undefined &&
+      (typeof value.engine !== "string" || !ENGINE_NAME_PATTERN.test(value.engine))) ||
+    (value.enginePath !== undefined && (typeof value.enginePath !== "string" || !value.enginePath.trim())) ||
     typeof value.browserPid !== "number" ||
     !Number.isSafeInteger(value.browserPid) ||
     value.browserPid <= 0 ||
@@ -145,6 +152,9 @@ export const readBrowserOwnerMetadata = async (path: string): Promise<BrowserOwn
     browserPid: value.browserPid,
     cleanShutdown: value.cleanShutdown,
     endpoint: value.endpoint,
+    ...(typeof value.engine === "string" && typeof value.enginePath === "string" ?
+      { engine: value.engine, enginePath: value.enginePath }
+    : {}),
     mode: parseBrowserMode(value.mode),
     ownerGeneration: value.ownerGeneration,
     processStartIdentity: value.processStartIdentity,

@@ -2,7 +2,9 @@ import { randomUUID } from "node:crypto";
 import { chmod, unlink } from "node:fs/promises";
 import { isNodeError } from "../../platform/node-errors";
 import { currentProcessStartIdentity } from "../runtime";
+import { stopAllRecipeProcesses } from "../runtime/recipe-launcher";
 import { createChromeBrokerBackend } from "./backend";
+import { readBrokerChildLaunch } from "./child-environment";
 import { cleanupBrokerChild, createBrokerChildTermination } from "./child-shutdown";
 import {
   BROKER_CHILD_EXECUTABLE_ENV,
@@ -29,6 +31,9 @@ const requiredEnvironment = (name: string): string => {
 const workspacePath = requiredEnvironment(BROKER_CHILD_WORKSPACE_ENV);
 const executablePath = requiredEnvironment(BROKER_CHILD_EXECUTABLE_ENV);
 const runtimeRoot = process.env[BROKER_CHILD_RUNTIME_ENV] || undefined;
+const { cdpEndpoint, engine } = readBrokerChildLaunch(process.env);
+// Every recipe process stops with the broker child, including on a fatal exit that skips graceful cleanup.
+process.on("exit", stopAllRecipeProcesses);
 const paths = await resolveBrokerRuntimePaths(workspacePath, runtimeRoot);
 await ensureOwnerOnlyBrokerRoot(paths);
 
@@ -41,7 +46,9 @@ const brokerId = randomUUID();
 const processStartIdentity = await currentProcessStartIdentity();
 await claimBrokerMetadata(paths.metadataPath, {
   brokerId,
+  ...(cdpEndpoint ? { cdpEndpoint } : {}),
   createdAt: new Date().toISOString(),
+  ...(engine ? { engine: { ...engine, args: [...engine.args], command: executablePath } } : {}),
   pid: process.pid,
   processStartIdentity,
   protocolVersion: BROKER_PROTOCOL_VERSION,
@@ -58,6 +65,8 @@ const removeOwnedMetadata = async (): Promise<void> => {
 };
 
 const backend = await createChromeBrokerBackend({
+  ...(cdpEndpoint ? { cdpEndpoint } : {}),
+  ...(engine ? { engine } : {}),
   executablePath,
   runtimeRoot,
   workspacePath: paths.canonicalWorkspace,

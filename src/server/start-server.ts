@@ -1,5 +1,5 @@
 import { CHROME_MCP_METADATA } from "../chrome/server/metadata";
-import { resolveChromeExecutable } from "../platform/chrome-executable";
+import { resolveServerEngine } from "./engine-options";
 import { parseServerOptions, SERVER_HELP } from "./options";
 
 export const startServer = async (args = process.argv.slice(2)) => {
@@ -21,7 +21,7 @@ export const startServer = async (args = process.argv.slice(2)) => {
     throw new Error("Better Chrome MCP requires Linux, macOS, or Windows.");
   }
 
-  const executablePath = await resolveChromeExecutable(options);
+  const { executablePath, engine } = await resolveServerEngine(options);
   const [
     { assertSupportedBunVersion },
     { createChromeMcpServer },
@@ -37,6 +37,8 @@ export const startServer = async (args = process.argv.slice(2)) => {
 
   const instructions = await Bun.file(new URL("../chrome/instructions.md", import.meta.url)).text();
   const service = await createChromeService({
+    ...(engine ? { engine } : {}),
+    ...(options.cdpEndpoint ? { cdpEndpoint: options.cdpEndpoint } : {}),
     executablePath,
     mainUserDataDir: options.mainUserDataDir,
     workspacePath: options.workspacePath,

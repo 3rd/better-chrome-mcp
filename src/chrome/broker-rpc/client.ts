@@ -18,6 +18,7 @@ import type {
   PersistentMutationInput,
   PersistentMutationKind,
 } from "../runtime";
+import { redactEndpointUrl } from "../runtime/endpoint-redaction";
 import type { PageViewportRequest, PageViewportState } from "../runtime/page-viewport";
 import type { PwaOperation, PwaResult } from "../runtime/pwa-controller";
 import type { ReactBrowserOperation, ReactOperationResult } from "../runtime/react-inspection-protocol";
@@ -25,7 +26,12 @@ import { getMcpRuntimeDir } from "../../platform/runtime-paths";
 import { isSupportedBunVersion, MINIMUM_BUN_VERSION_TEXT } from "../bun-version";
 import { probeProcessIdentity } from "../runtime";
 import { MAIN_CHROME_CONNECT_TIMEOUT_MS } from "../runtime/browser-launcher";
-import { assertMatchingNativeDeviceScaleFactor, assertNativeDeviceScaleFactor } from "../runtime/modes";
+import type { LaunchedEngine, RecipeEngine } from "../runtime/engine-recipes";
+import {
+  assertMatchingNativeDeviceScaleFactor,
+  assertNativeDeviceScaleFactor,
+  isAttachedMode,
+} from "../runtime/modes";
 import { resolveBrokerChildProcess } from "./child-environment";
 import {
   BROKER_ADMISSION_RESPONSE_GRACE_MS,
@@ -71,6 +77,21 @@ export const brokerAdmissionRequestTimeoutMs = (deadlineAt: number | undefined, 
   deadlineAt === undefined ? BROKER_REQUEST_TIMEOUT_MS : (
     Math.max(BROKER_REQUEST_TIMEOUT_MS, deadlineAt - now + BROKER_ADMISSION_RESPONSE_GRACE_MS)
   );
+
+// When the client gives up first, the broker closes the session that arrives late and stops a launched engine, so
+// this budget must cover how long the broker may legitimately spend opening the browser.
+export const calculateSessionAcquireTimeoutMs = (mode: BrowserMode, engine: RecipeEngine | undefined) => {
+  if (mode === "main") {
+    return MAIN_CHROME_CONNECT_TIMEOUT_MS + BROKER_REQUEST_TIMEOUT_MS + BROKER_ADMISSION_RESPONSE_GRACE_MS;
+  }
+
+  const launchesRecipeEngine = engine !== undefined && !isAttachedMode(mode);
+  if (launchesRecipeEngine) {
+    return engine.startupTimeoutMs + BROKER_REQUEST_TIMEOUT_MS + BROKER_ADMISSION_RESPONSE_GRACE_MS;
+  }
+
+  return BROKER_REQUEST_TIMEOUT_MS;
+};
 
 type PendingRequest = Readonly<{
   reject: (error: Error) => void;
@@ -1133,8 +1154,10 @@ class BrokerRemoteSession implements RemoteBrowserSession {
 }
 
 export type ChromeBrokerClientOptions = Readonly<{
+  cdpEndpoint?: string;
   connectionId: string;
   connectBudgetMs?: number;
+  engine?: RecipeEngine;
   executablePath: string;
   mainUserDataDir?: string;
   runtimeRoot?: string;
@@ -1205,6 +1228,34 @@ const assertBrokerIsNotNewer = (metadata: BrokerMetadata): void => {
   );
 };
 
+export const describeBrokerLaunch = (
+  launch: Readonly<{ engine?: LaunchedEngine; cdpEndpoint?: string }>,
+): string => {
+  const engine = launch.engine
+    ? `engine ${launch.engine.name} (${[launch.engine.command, ...launch.engine.args].join(" ")})`
+    : "engine chrome";
+  return `${engine}, ${launch.cdpEndpoint ? `CDP endpoint ${redactEndpointUrl(launch.cdpEndpoint)}` : "no CDP endpoint"}`;
+};
+
+/** Refuses a running broker started for another engine, recipe or endpoint. For Chrome the executable path is not compared. */
+export const assertBrokerLaunchMatches = (
+  metadata: BrokerMetadata,
+  options: ChromeBrokerClientOptions,
+): void => {
+  const requested = {
+    engine: options.engine
+      ? { ...options.engine, args: [...options.engine.args], command: options.executablePath }
+      : undefined,
+    cdpEndpoint: options.cdpEndpoint,
+  };
+  const existing = { engine: metadata.engine, cdpEndpoint: metadata.cdpEndpoint };
+  if (Bun.deepEquals(requested, existing)) return;
+  throw new BrokerRpcError(
+    "CHROME_MCP_BROKER_UNAVAILABLE",
+    `Another session on this workspace started the browser broker with ${describeBrokerLaunch(existing)}, but this server is configured for ${describeBrokerLaunch(requested)}. Start every server on this workspace with the same --engine, --engine-config, --executable-path and --cdp-endpoint, or close the other sessions and wait a few seconds before retrying`,
+  );
+};
+
 const connectMetadata = async (
   metadata: BrokerMetadata,
   connectionId: string,
@@ -1249,6 +1300,8 @@ const spawnBrokerChild = async (options: ChromeBrokerClientOptions, paths: Broke
     const logMetadata = await log.stat();
     const logOffset = logMetadata.size;
     const source = resolveBrokerChildProcess({
+      ...(options.cdpEndpoint ? { cdpEndpoint: options.cdpEndpoint } : {}),
+      ...(options.engine ? { engine: options.engine } : {}),
       executablePath: options.executablePath,
       runtimeRoot: options.runtimeRoot,
       workspacePath: paths.canonicalWorkspace,
@@ -1306,7 +1359,8 @@ const isBrokerProcessPossiblyRunning = async (metadata: BrokerMetadata) => {
   return identity === "same" || identity === "unknown";
 };
 
-const connectOrRetireLockedBroker = async (
+export const connectOrRetireLockedBroker = async (
+  options: ChromeBrokerClientOptions,
   paths: BrokerRuntimePaths,
   connectionId: string,
   deadline: number,
@@ -1315,6 +1369,8 @@ const connectOrRetireLockedBroker = async (
   if (current) {
     assertBrokerIsNotNewer(current);
     if (brokerMetadataVersion(current) === BROKER_PROTOCOL_VERSION) {
+      // A dead broker leaves its metadata behind; only a live or unidentifiable one can conflict.
+      if (await isBrokerProcessPossiblyRunning(current)) assertBrokerLaunchMatches(current, options);
       try {
         const connected = await connectMetadata(
           current,
@@ -1359,6 +1415,8 @@ const connectOrSpawn = async (
     if (metadata) {
       assertBrokerIsNotNewer(metadata);
       if (brokerMetadataVersion(metadata) === BROKER_PROTOCOL_VERSION) {
+        // A dead broker leaves its metadata behind; only a live or unidentifiable one can conflict.
+        if (await isBrokerProcessPossiblyRunning(metadata)) assertBrokerLaunchMatches(metadata, options);
         try {
           const connected = await connectMetadata(
             metadata,
@@ -1391,7 +1449,7 @@ const connectOrSpawn = async (
       continue;
     }
     try {
-      const connected = await connectOrRetireLockedBroker(paths, connectionId, deadline);
+      const connected = await connectOrRetireLockedBroker(options, paths, connectionId, deadline);
       if (connected) return connected;
       await removeBrokerRuntimeFiles(paths);
       const startup = await spawnBrokerChild({ ...options, runtimeRoot }, paths);
@@ -1400,6 +1458,9 @@ const connectOrSpawn = async (
         const started = await readBrokerMetadata(paths.metadataPath);
         if (started) {
           assertBrokerIsNotNewer(started);
+          if (brokerMetadataVersion(started) === BROKER_PROTOCOL_VERSION) {
+            assertBrokerLaunchMatches(started, options);
+          }
 
           try {
             const startedConnection = await connectMetadata(
@@ -1472,10 +1533,7 @@ export const connectChromeBroker = async (
 
       nativeScales.set(mode, nativeDeviceScaleFactor);
       const acquisition = (async () => {
-        const timeoutMs =
-          mode === "main" ?
-            MAIN_CHROME_CONNECT_TIMEOUT_MS + BROKER_REQUEST_TIMEOUT_MS + BROKER_ADMISSION_RESPONSE_GRACE_MS
-          : BROKER_REQUEST_TIMEOUT_MS;
+        const timeoutMs = calculateSessionAcquireTimeoutMs(mode, options.engine);
         const mainUserDataDir = mode === "main" ? options.mainUserDataDir : undefined;
         const result = brokerResults.acquired.parse(
           await connected.connection.request(

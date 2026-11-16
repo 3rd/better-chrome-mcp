@@ -39,11 +39,24 @@ import {
   type ReactOperationResult,
 } from "../runtime/react-inspection-protocol";
 import { BrokerRuntime } from "../server/broker-runtime";
-import { createBrokerChildEnvironment, resolveBrokerChildProcess } from "./child-environment";
+import {
+  createBrokerChildEnvironment,
+  readBrokerChildLaunch,
+  resolveBrokerChildProcess,
+} from "./child-environment";
 import * as childEnvironment from "./child-environment";
 import { createBrokerChildTermination } from "./child-shutdown";
-import { brokerAdmissionRequestTimeoutMs, type ChromeBrokerClient, connectChromeBroker } from "./client";
 import {
+  assertBrokerLaunchMatches,
+  brokerAdmissionRequestTimeoutMs,
+  type ChromeBrokerClient,
+  connectChromeBroker,
+  connectOrRetireLockedBroker,
+  calculateSessionAcquireTimeoutMs,
+} from "./client";
+import {
+  BROKER_CHILD_CDP_ENDPOINT_ENV,
+  BROKER_CHILD_ENGINE_ENV,
   BROKER_CHILD_EXECUTABLE_ENV,
   BROKER_CHILD_RUNTIME_ENV,
   BROKER_CHILD_WORKSPACE_ENV,
@@ -66,6 +79,12 @@ import {
 import { type BrokerRequest, brokerResponseSchema, journalReadOptionsSchema } from "./protocol";
 import { retireChromeBroker } from "./retirement";
 import { type BrokerRpcServer, startBrokerRpcServer } from "./server";
+
+const OBSCURA = {
+  name: "obscura",
+  args: ["serve", "--port", "{port}", "--storage-dir", "{profileDir}", "--allow-private-network"],
+  startupTimeoutMs: 10_000,
+};
 
 type FakeOwner = {
   clients: number;
@@ -864,7 +883,7 @@ describe("broker lifecycle and protocol", () => {
 
   test("accepts only internal prepare and staged-node React broker operations", () => {
     const key = "__chromeMcpReactNode_0123456789abcdef0123456789abcdef";
-    expect(BROKER_PROTOCOL_VERSION).toBe(16);
+    expect(BROKER_PROTOCOL_VERSION).toBe(17);
     expect(reactBrowserOperationSchema.parse({ operation: "prepare" })).toEqual({ operation: "prepare" });
     expect(
       reactBrowserOperationSchema.parse({
@@ -2269,5 +2288,242 @@ setInterval(() => { if (!existsSync(path)) process.exit(0); }, 100);`;
       clearInterval(check);
       await rm(root, { force: true, recursive: true });
     }
+  });
+});
+
+describe("broker engine and CDP endpoint", () => {
+  const writeLiveMetadata = async (
+    root: string,
+    extra: Pick<BrokerMetadata, "cdpEndpoint" | "engine">,
+  ): Promise<void> => {
+    const paths = await resolveBrokerRuntimePaths(root, join(root, "runtime"));
+    await ensureOwnerOnlyBrokerRoot(paths);
+    await writeBrokerMetadata(paths.metadataPath, {
+      brokerId: randomUUID(),
+      createdAt: new Date().toISOString(),
+      pid: process.pid,
+      processStartIdentity: await currentProcessStartIdentity(),
+      protocolVersion: BROKER_PROTOCOL_VERSION,
+      socketPath: paths.socketPath,
+      workspaceHash: paths.workspaceHash,
+      ...extra,
+    });
+  };
+
+  test("passes a recipe engine and CDP endpoint to the broker child only when they are set", () => {
+    const env = createBrokerChildEnvironment({
+      executablePath: "/engines/obscura",
+      engine: OBSCURA,
+      cdpEndpoint: "http://127.0.0.1:9222/",
+      runtimeRoot: "/runtime",
+      source: { PATH: "/bin" },
+      workspacePath: "/workspace",
+    });
+    expect(env).toMatchObject({
+      [BROKER_CHILD_ENGINE_ENV]: JSON.stringify(OBSCURA),
+      [BROKER_CHILD_CDP_ENDPOINT_ENV]: "http://127.0.0.1:9222/",
+    });
+    expect(readBrokerChildLaunch(env)).toEqual({ engine: OBSCURA, cdpEndpoint: "http://127.0.0.1:9222/" });
+    expect(readBrokerChildLaunch({})).toEqual({});
+    expect(() => readBrokerChildLaunch({ [BROKER_CHILD_ENGINE_ENV]: "{" })).toThrow(
+      "Chrome broker child received a malformed CHROME_MCP_BROKER_ENGINE",
+    );
+  });
+
+  test("refuses a broker started with another engine and names both configurations", async () => {
+    const root = await mkdtemp(join(tmpdir(), "chrome-broker-engine-mismatch-"));
+    try {
+      await writeLiveMetadata(root, { engine: { ...OBSCURA, command: "/engines/obscura" } });
+      await expect(
+        connectChromeBroker({
+          connectionId: "engine-mismatch",
+          connectBudgetMs: 2000,
+          executablePath: "/chrome",
+          runtimeRoot: join(root, "runtime"),
+          workspacePath: root,
+        }),
+      ).rejects.toMatchObject({
+        code: "CHROME_MCP_BROKER_UNAVAILABLE",
+        message: expect.stringContaining(
+          "started the browser broker with engine obscura (/engines/obscura serve --port {port} --storage-dir {profileDir} --allow-private-network), no CDP endpoint, but this server is configured for engine chrome, no CDP endpoint",
+        ),
+      });
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  test("refuses a broker started with another CDP endpoint", async () => {
+    const root = await mkdtemp(join(tmpdir(), "chrome-broker-endpoint-mismatch-"));
+    try {
+      await writeLiveMetadata(root, { cdpEndpoint: "http://127.0.0.1:9222/" });
+      const rejection = connectChromeBroker({
+        cdpEndpoint: "http://127.0.0.1:9333/",
+        connectionId: "endpoint-mismatch",
+        connectBudgetMs: 2000,
+        executablePath: "/chrome",
+        runtimeRoot: join(root, "runtime"),
+        workspacePath: root,
+      });
+      await expect(rejection).rejects.toMatchObject({
+        code: "CHROME_MCP_BROKER_UNAVAILABLE",
+        message: expect.stringContaining(
+          "engine chrome, CDP endpoint http://127.0.0.1:9222/, but this server is configured for engine chrome, CDP endpoint http://127.0.0.1:9333/",
+        ),
+      });
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  test("redacts credentials and the query of CDP endpoints in the mismatch refusal", async () => {
+    const root = await mkdtemp(join(tmpdir(), "chrome-broker-endpoint-redaction-"));
+    try {
+      await writeLiveMetadata(root, { cdpEndpoint: "http://user:secret@127.0.0.1:9222/cdp?token=abc" });
+      const rejection = connectChromeBroker({
+        cdpEndpoint: "http://other:hidden@127.0.0.1:9333/",
+        connectionId: "endpoint-redaction",
+        connectBudgetMs: 2000,
+        executablePath: "/chrome",
+        runtimeRoot: join(root, "runtime"),
+        workspacePath: root,
+      });
+      const error = await rejection.then(
+        () => undefined,
+        (reason: unknown) => reason,
+      );
+      expect(error).toMatchObject({
+        code: "CHROME_MCP_BROKER_UNAVAILABLE",
+        message: expect.stringContaining(
+          "CDP endpoint http://***@127.0.0.1:9222/cdp?***, but this server is configured for engine chrome, CDP endpoint http://***@127.0.0.1:9333/",
+        ),
+      });
+      for (const secret of ["secret", "hidden", "token=abc"]) {
+        expect(String((error as Error | undefined)?.message)).not.toContain(secret);
+      }
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  test("replaces stale metadata from a dead broker of another configuration instead of refusing it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "chrome-broker-stale-engine-"));
+    const runtimeRoot = join(root, "runtime");
+    const paths = await resolveBrokerRuntimePaths(root, runtimeRoot);
+    await ensureOwnerOnlyBrokerRoot(paths);
+    const dead = Bun.spawn(["sleep", "30"], { stderr: "ignore", stdout: "ignore" });
+    const identity = await currentProcessStartIdentity(dead.pid);
+    dead.kill();
+    await dead.exited;
+    const brokerId = randomUUID();
+    await writeBrokerMetadata(paths.metadataPath, {
+      brokerId,
+      createdAt: new Date().toISOString(),
+      engine: { ...OBSCURA, command: "/engines/obscura" },
+      pid: dead.pid,
+      processStartIdentity: identity,
+      protocolVersion: BROKER_PROTOCOL_VERSION,
+      socketPath: paths.socketPath,
+      workspaceHash: paths.workspaceHash,
+    });
+    let replacement: ChromeBrokerClient | undefined;
+    try {
+      replacement = await connectChromeBroker({
+        connectionId: "stale-engine-replacement",
+        executablePath: "/bin/true",
+        runtimeRoot,
+        workspacePath: root,
+      });
+      expect(replacement.brokerPid).not.toBe(dead.pid);
+      const current = await readBrokerMetadata(paths.metadataPath);
+      expect(current?.brokerId).not.toBe(brokerId);
+      expect(current?.engine).toBeUndefined();
+    } finally {
+      const brokerPid = replacement?.brokerPid;
+      await replacement?.close();
+      if (brokerPid !== undefined) {
+        // The broker child holds the workspace as its cwd, which blocks removal on Windows until it exits.
+        try {
+          process.kill(brokerPid, "SIGKILL");
+        } catch {
+          // Already exited.
+        }
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          try {
+            process.kill(brokerPid, 0);
+          } catch {
+            break;
+          }
+          await Bun.sleep(50);
+        }
+      }
+      await rm(root, { force: true, maxRetries: 20, recursive: true, retryDelay: 100 });
+    }
+  });
+
+  test("refuses a live broker of another configuration while holding the startup lock", async () => {
+    const root = await mkdtemp(join(tmpdir(), "chrome-broker-locked-mismatch-"));
+    const runtimeRoot = join(root, "runtime");
+    try {
+      await writeLiveMetadata(root, { engine: { ...OBSCURA, command: "/engines/obscura" } });
+      const paths = await resolveBrokerRuntimePaths(root, runtimeRoot);
+      // A held startup lock forces the locked-retire path to be the one that reads the metadata.
+      const lock = await tryAcquireBrokerStartupLock(paths.startupLockPath);
+      expect(lock).toBeDefined();
+      try {
+        await expect(
+          connectOrRetireLockedBroker(
+            { connectionId: "locked-mismatch", executablePath: "/chrome", runtimeRoot, workspacePath: root },
+            paths,
+            "locked-mismatch",
+            Date.now() + 2000,
+          ),
+        ).rejects.toMatchObject({
+          code: "CHROME_MCP_BROKER_UNAVAILABLE",
+          message: expect.stringContaining(
+            "started the browser broker with engine obscura (/engines/obscura serve --port {port} --storage-dir {profileDir} --allow-private-network), no CDP endpoint, but this server is configured for engine chrome, no CDP endpoint",
+          ),
+        });
+      } finally {
+        await lock?.release();
+      }
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  test("accepts broker metadata whose engine and endpoint match", () => {
+    const metadata: BrokerMetadata = {
+      brokerId: randomUUID(),
+      createdAt: new Date().toISOString(),
+      pid: process.pid,
+      processStartIdentity: "synthetic",
+      protocolVersion: BROKER_PROTOCOL_VERSION,
+      socketPath: "/socket",
+      workspaceHash: "0".repeat(64),
+    };
+    expect(() =>
+      assertBrokerLaunchMatches(
+        { ...metadata, engine: { ...OBSCURA, command: "/e" }, cdpEndpoint: "http://h:1/" },
+        {
+          connectionId: "c",
+          executablePath: "/e",
+          engine: OBSCURA,
+          cdpEndpoint: "http://h:1/",
+          workspacePath: "/w",
+        },
+      ),
+    ).not.toThrow();
+    expect(() =>
+      assertBrokerLaunchMatches(metadata, {
+        connectionId: "c",
+        executablePath: "/another-chrome",
+        workspacePath: "/w",
+      }),
+    ).not.toThrow();
+  });
+
+  test("gives a launched recipe engine longer than its startup timeout to open a session", () => {
+    expect(calculateSessionAcquireTimeoutMs("shared-headless", { ...OBSCURA, startupTimeoutMs: 60_000 })).toBeGreaterThan(60_000);
   });
 });

@@ -25,6 +25,7 @@ export type ChromeRuntimePaths = Readonly<{
 
 export type ChromeRuntimePathOptions = Readonly<{
   dataHome?: string;
+  engineName?: string;
   home?: string;
   runtimeRoot?: string;
 }>;
@@ -59,10 +60,11 @@ export const resolveChromeRuntimePaths = (
   const dataHome = options.dataHome ?? process.env.XDG_DATA_HOME ?? join(home, ".local", "share");
   const runtimeRoot = join(options.runtimeRoot ?? getMcpRuntimeDir(), "chrome-mcp");
   const ownerName = ownerDirectoryName(key);
+  const engineSegment = options.engineName === undefined ? [] : [options.engineName];
   const profileRoot =
     isSharedMode(key.mode) ?
-      join(dataHome, "chrome-mcp", "profiles", key.workspaceHash, key.mode)
-    : join(runtimeRoot, "chrome-profiles", ownerName);
+      join(dataHome, "chrome-mcp", "profiles", ...engineSegment, key.workspaceHash, key.mode)
+    : join(runtimeRoot, "chrome-profiles", ...engineSegment, ownerName);
 
   return Object.freeze({
     crashMarkerPath: join(profileRoot, "crash-marker.json"),

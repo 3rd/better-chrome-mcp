@@ -125,6 +125,53 @@ Read the installed client's MCP configuration instructions. For clients that use
 
 Use the client's documented configuration file and reload mechanism. Do not paste this shape into a client with a different schema.
 
+### Other browser engines and the remote mode
+
+`--engine chrome` is the default and does not change. The built-in engines `obscura` and `lightpanda` each need `--executable-path <program>` or a `command` in `--engine-config`. `CHROME_MCP_EXECUTABLE_PATH` applies to Chrome only.
+
+```bash
+claude mcp add --transport stdio --scope local chrome-mcp -- bun /absolute/path/to/checkout/src/index.ts --engine obscura --executable-path /absolute/path/to/obscura
+```
+
+`--engine-config <file>` adds more engines, or sets the program for a built-in one. A relative path resolves from the current directory. The file looks like this:
+
+```json
+{
+  "engines": {
+    "obscura": {
+      "command": "/absolute/path/to/obscura",
+      "args": ["serve", "--port", "{port}", "--storage-dir", "{profileDir}", "--allow-private-network"],
+      "startupTimeoutMs": 10000
+    }
+  }
+}
+```
+
+- `command` is the absolute path of the program. A recipe in a file must have it. `--executable-path` overrides it for the selected engine.
+- `args` is an array of strings, run without a shell. `{port}` is required. `{profileDir}` is optional.
+- `startupTimeoutMs` defaults to `10000`.
+- Unknown keys and unknown placeholders fail at start. The whole file is validated, even when `--engine` names another engine. A file cannot override the `chrome` name.
+
+A recipe engine runs headless only, because a recipe starts the same way for every mode: it supports `isolated-headless` and `shared-headless`, and its other launched modes return `CHROME_MCP_ENGINE_UNSUPPORTED_MODE`. The `main` mode always attaches to the user's own Chrome and ignores `--engine`. The profiles of a recipe engine live under `profiles/<engine>/<workspace hash>/<mode>`, apart from Chrome's.
+
+Every page of a recipe engine starts with the same 1920x1080 viewport as Chrome's headless modes, set before a script can use the page. An engine that does not implement `Emulation.setDeviceMetricsOverride` keeps its own size.
+
+`--cdp-endpoint <url>` turns on the `remote` mode. The URL is `http(s)://host:port`, read through `/json/version`, or `ws(s)://`. Without it, `remote` returns `CHROME_MCP_REMOTE_UNAVAILABLE`. A non-loopback endpoint gives the agent code execution in that browser, and the server never closes it. Point it only at a browser the user trusts the agent with.
+
+All sessions on one project share one broker. A different `--engine`, recipe, engine program, or `--cdp-endpoint` gets `CHROME_MCP_BROKER_UNAVAILABLE`, which names both configurations. Close every session on the project and wait a few seconds before switching. To run two engines on one project at the same time, give each MCP entry its own `CHROME_MCP_RUNTIME_DIR` folder, so each gets its own broker.
+
+What each engine is known to support:
+
+| Tool | Chrome | obscura | lightpanda |
+| --- | --- | --- | --- |
+| `run_playwright` | supported | supported | untested; the recipe is written from its published CLI |
+| Performance trace | supported | not supported; obscura has no `Tracing` domain | untested; the recipe is written from its published CLI |
+| Heap snapshot | supported | supported | untested; the recipe is written from its published CLI |
+| Lighthouse | supported | `mode: "snapshot"` works; navigation mode not verified | untested; the recipe is written from its published CLI |
+| React tools | supported | not expected to work | untested; the recipe is written from its published CLI |
+
+obscura was checked with an acceptance test: the section 4 click-and-persist check passes, the heap snapshot saves a non-empty file, a visible mode returns `CHROME_MCP_ENGINE_UNSUPPORTED_MODE`, and a real close takes about 1.1 seconds. obscura must answer `Target.getTargetInfo` on page sessions with that page, announce existing pages on `Target.setAutoAttach` from a browser session, and attach and detach new pages on such sessions. With an obscura build lacking these, the first call returns `CHROME_MCP_PAGE_CLOSED`. Tools pass the engine's CDP errors through unchanged.
+
 ## 4. Verify through each client
 
 Use a new or reconnected session of each configured client. If the current session cannot reload its MCP tools, finish the configuration and give the user the exact restart-and-test step; do not report a successful browser test yet.
@@ -183,6 +230,8 @@ Do these steps in each configured client, with a different `browserInstanceId` i
 
    Expect `ok: true` and `sharedTitle: "MCP shared profile check"`. The call creates the project's persistent `shared-headless` profile, in the folder named under [Diagnose common failures](#diagnose-common-failures), and closes the browser it started. If another session already has this project's shared browser open, the close fails with `CHROME_MCP_BROWSER_CLOSE_FORBIDDEN`; leave that browser open and treat this step as skipped.
 
+With `--engine obscura`, run steps 3 to 5 unchanged. Step 5 (`shared-headless`) also exercises the engine's own profile folder under `profiles/<engine>/`.
+
 ## Diagnose common failures
 
 - **The client cannot start the server:** check that the configured path to `src/index.ts` exists and that `bun install --frozen-lockfile` has run in the checkout. Graphical clients can have a different `PATH` from the terminal; use Bun's absolute path in place of `bun`.
@@ -191,6 +240,8 @@ Do these steps in each configured client, with a different `browserInstanceId` i
 - **Profile lock or process identity errors:** on Linux, check that `flock` is on `PATH`. On macOS and Windows these use native system calls; reproduce with the platform tests under [Repair from the repository](#repair-from-the-repository). Do not delete another browser's profile, bypass the lock, or replace the identity check with a bare process ID to make startup succeed.
 - **React tools are missing:** the project needs React installed in `node_modules`; a dependency declaration alone is not enough. Check `--workspace`, or pass `--react on`.
 - **React tools appear in a project without React:** pass `--react off`.
+- **An engine fails to start, or a mode returns `CHROME_MCP_ENGINE_UNSUPPORTED_MODE`:** check that `--executable-path` or the recipe's `command` is an absolute path to the engine's program, and that `args` contains `{port}`. A recipe engine supports only `isolated-headless` and `shared-headless`.
+- **`remote` returns `CHROME_MCP_REMOTE_UNAVAILABLE`, or a call returns `CHROME_MCP_BROKER_UNAVAILABLE`:** pass `--cdp-endpoint` to enable `remote`. The broker keeps the engine, recipe, program, and endpoint of the session that started it, so close every session on the project and wait a few seconds before changing them.
 - **The `main` mode reports `CHROME_MCP_MAIN_UNAVAILABLE`:** remote debugging must be switched on in the user's browser at `chrome://inspect/#remote-debugging`. For a browser other than Google Chrome, pass its profile folder with `--main-user-data-dir`. Sessions on one project that use `main` at the same time need the same folder.
 
 The profiles of the `shared` and `shared-headless` modes persist under `$XDG_DATA_HOME/chrome-mcp/profiles`, by default `~/.local/share/chrome-mcp/profiles`. Preserve them during diagnosis. Limit cleanup to the processes and temporary files this check created.
@@ -218,6 +269,7 @@ Where to start for a given problem:
 - **Profile lock:** [profile-lease.ts](src/chrome/runtime/profile-lease.ts) coordinates leases and starts a child process that holds the lock. Linux runs the `flock` command; macOS runs [darwin/profile-lock-child.ts](src/platform/darwin/profile-lock-child.ts); Windows runs [windows/profile-lock-child.ts](src/platform/windows/profile-lock-child.ts).
 - **Broker startup, connection, and log:** [client.ts](src/chrome/broker-rpc/client.ts), [child.ts](src/chrome/broker-rpc/child.ts), and [paths.ts](src/chrome/broker-rpc/paths.ts), which decides the socket or pipe name. [child-environment.ts](src/chrome/broker-rpc/child-environment.ts) builds the broker's command and environment.
 - **Child process environment:** [runner.ts](src/chrome/execution/runner.ts) and [browser-launcher.ts](src/chrome/runtime/browser-launcher.ts) list the variables that workers and Chrome receive; [windows/environment.ts](src/platform/windows/environment.ts) adds the ones Windows programs need.
+- **Engines and the remote mode:** [engine-recipes.ts](src/chrome/runtime/engine-recipes.ts) parses and selects recipes, [recipe-launcher.ts](src/chrome/runtime/recipe-launcher.ts) starts the process, polls `/json/version`, and stops it, and [devtools-endpoint.ts](src/chrome/runtime/devtools-endpoint.ts) resolves the endpoint, including `remote`.
 - **Browser launch and ownership:** [browser-launcher.ts](src/chrome/runtime/browser-launcher.ts) starts Chrome through `playwright-core`, and [browser-owner.ts](src/chrome/runtime/browser-owner.ts) owns its lifetime. [paths.ts](src/chrome/runtime/paths.ts) decides the profile folders.
 - **Script execution and helpers:** [runner.ts](src/chrome/execution/runner.ts), [worker.ts](src/chrome/execution/worker.ts), [playwright-session.ts](src/chrome/execution/playwright-session.ts), and [helpers.ts](src/chrome/execution/helpers.ts).
 - **Diagnostics and captures:** [diagnostics/](src/chrome/diagnostics/) holds traces, Lighthouse, and heap snapshots. [captures/](src/chrome/captures/) holds screenshots and recordings, and [artifacts/](src/chrome/artifacts/) stores their results.

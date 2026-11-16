@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
-import { CdpCommandError, cdpRecord } from "./cdp-connection";
+import { CDP_METHOD_NOT_FOUND, CDP_SERVER_ERROR, CdpCommandError, cdpRecord } from "./cdp-connection";
 import { CdpRelay } from "./cdp-relay";
 import { FakeCdpClient, type FakeCdpCommand } from "./fake-cdp-client.test-support";
 
@@ -68,14 +68,45 @@ const createRelay = (command?: (command: FakeCdpCommand) => Promise<unknown>): R
   return harness;
 };
 
+type CommandAnswers = Readonly<Record<string, (command: FakeCdpCommand) => Promise<unknown>>>;
+
+const createSizingRelay = (answers: CommandAnswers): RelayHarness => {
+  let nextSession = 1;
+  const connection = new FakeCdpClient(undefined, async (command) => {
+    if (command.method === "Target.attachToBrowserTarget") return { sessionId: `browser-${nextSession++}` };
+    return answers[command.method]?.(command) ?? {};
+  });
+  const harness = { connection, relay: CdpRelay.listen(connection, { defaultViewport: { height: 1080, width: 1920 } }) };
+  harnesses.push(harness);
+
+  return harness;
+};
+
+const emitPageAttach = (connection: FakeCdpClient, targetId: string, sessionId = `${targetId}-session`) => {
+  connection.emit(
+    "Target.attachedToTarget",
+    { sessionId, targetInfo: { targetId, type: "page", url: "about:blank" } },
+    "browser-1",
+  );
+};
+
+const listSizedSessionIds = (connection: FakeCdpClient) => {
+  return connection.commands
+    .filter((command) => command.method === "Emulation.setDeviceMetricsOverride")
+    .map((command) => command.sessionId);
+};
+
 test("excludes unavailable and unsupported tabs without blocking healthy worker sessions", async () => {
   const connection = new FakeCdpClient(undefined, async ({ method }) => {
     if (method === "Target.attachToBrowserTarget") return { sessionId: "browser" };
     return {};
   });
-  const relay = CdpRelay.listen(connection, (targetId) =>
-    targetId === "stalled" ? "Runtime.enable timed out" : undefined,
-  );
+  const relay = CdpRelay.listen(connection, {
+    unavailableTarget: (targetId) => {
+      if (targetId === "stalled") return "Runtime.enable timed out";
+      return undefined;
+    },
+  });
   harnesses.push({ connection, relay });
   const client = await connectClient(relay);
   client.send({ id: 1, method: "Browser.getVersion" });
@@ -700,6 +731,156 @@ describe("CdpRelay", () => {
     client.socket.close();
     await detaching;
     expect(connection.forwardedSessions.size).toBe(0);
+  });
+
+  test("sizes a newly attached page before its client hears of it or of anything after it", async () => {
+    const sizeReply = Promise.withResolvers<void>();
+    const { connection, relay } = createSizingRelay({
+      "Emulation.setDeviceMetricsOverride": () => sizeReply.promise,
+    });
+    const client = await connectClient(relay);
+    client.send({ id: 1, method: "Browser.getVersion" });
+    await client.next();
+
+    const bystander = await connectClient(relay);
+    bystander.send({ id: 1, method: "Browser.getVersion" });
+    await bystander.next();
+
+    connection.emit(
+      "Target.attachedToTarget",
+      {
+        sessionId: "page-session",
+        targetInfo: { targetId: "page", type: "page", url: "about:blank" },
+        waitingForDebugger: true,
+      },
+      "browser-1",
+    );
+    connection.emit(
+      "Target.attachedToTarget",
+      { sessionId: "frame-session", targetInfo: { targetId: "frame", type: "iframe", url: "about:blank" } },
+      "page-session",
+    );
+    bystander.send({ id: 2, method: "Browser.getVersion" });
+    await bystander.next();
+    expect(client.messages).toEqual([]);
+
+    sizeReply.resolve();
+    expect(await client.next()).toMatchObject({
+      method: "Target.attachedToTarget",
+      params: { sessionId: "page-session" },
+    });
+    expect(await client.next()).toMatchObject({
+      method: "Target.attachedToTarget",
+      params: { sessionId: "frame-session" },
+      sessionId: "page-session",
+    });
+    expect(connection.commands.filter((command) => command.method === "Emulation.setDeviceMetricsOverride")).toEqual([
+      {
+        method: "Emulation.setDeviceMetricsOverride",
+        params: {
+          deviceScaleFactor: 1,
+          height: 1080,
+          mobile: false,
+          screenHeight: 1080,
+          screenOrientation: { angle: 0, type: "landscapePrimary" },
+          screenWidth: 1920,
+          width: 1920,
+        },
+        sessionId: "page-session",
+      },
+    ]);
+  });
+
+  test("keeps sizing later pages after one page fails to take the size", async () => {
+    let sizeAttempts = 0;
+    const { connection, relay } = createSizingRelay({
+      "Emulation.setDeviceMetricsOverride": async () => {
+        sizeAttempts++;
+        if (sizeAttempts === 1) throw new CdpCommandError("Target closed", CDP_SERVER_ERROR);
+
+        return {};
+      },
+    });
+    const client = await connectClient(relay);
+    client.send({ id: 1, method: "Browser.getVersion" });
+    await client.next();
+
+    emitPageAttach(connection, "closing-page");
+    expect(await client.next()).toMatchObject({ params: { sessionId: "closing-page-session" } });
+
+    emitPageAttach(connection, "later-page");
+    expect(await client.next()).toMatchObject({ params: { sessionId: "later-page-session" } });
+
+    expect(listSizedSessionIds(connection)).toEqual(["closing-page-session", "later-page-session"]);
+    expect(relay.defaultViewport).toEqual({ height: 1080, width: 1920 });
+  });
+
+  test("stops sizing pages once the browser does not know the size command", async () => {
+    const { connection, relay } = createSizingRelay({
+      "Emulation.setDeviceMetricsOverride": () => {
+        return Promise.reject(
+          new CdpCommandError("'Emulation.setDeviceMetricsOverride' wasn't found", CDP_METHOD_NOT_FOUND),
+        );
+      },
+    });
+    const client = await connectClient(relay);
+    client.send({ id: 1, method: "Browser.getVersion" });
+    await client.next();
+
+    emitPageAttach(connection, "first-page");
+    expect(await client.next()).toMatchObject({ params: { sessionId: "first-page-session" } });
+
+    emitPageAttach(connection, "second-page");
+    expect(await client.next()).toMatchObject({ params: { sessionId: "second-page-session" } });
+
+    expect(listSizedSessionIds(connection)).toEqual(["first-page-session"]);
+    expect(relay.defaultViewport).toBeUndefined();
+  });
+
+  test("leaves sessions a client attaches explicitly at the page's current size, whichever arrives first", async () => {
+    const attachReplies: PromiseWithResolvers<unknown>[] = [];
+    const { connection, relay } = createSizingRelay({
+      "Target.attachToTarget": () => {
+        const reply = Promise.withResolvers<unknown>();
+        attachReplies.push(reply);
+
+        return reply.promise;
+      },
+    });
+    const client = await connectClient(relay);
+    client.send({ id: 1, method: "Browser.getVersion" });
+    await client.next();
+
+    const firstSent = connection.waitForCommand("Target.attachToTarget");
+    client.send({ id: 2, method: "Target.attachToTarget", params: { flatten: true, targetId: "event-first" } });
+    await firstSent;
+    const secondSent = connection.waitForCommand("Target.attachToTarget");
+    client.send({ id: 3, method: "Target.attachToTarget", params: { flatten: true, targetId: "event-first" } });
+    await secondSent;
+
+    emitPageAttach(connection, "event-first", "first-session");
+    expect(await client.next()).toMatchObject({ params: { sessionId: "first-session" } });
+
+    attachReplies[0]?.resolve({ sessionId: "first-session" });
+    expect(await client.next()).toMatchObject({ id: 2, result: { sessionId: "first-session" } });
+
+    emitPageAttach(connection, "event-first", "second-session");
+    expect(await client.next()).toMatchObject({ params: { sessionId: "second-session" } });
+
+    attachReplies[1]?.resolve({ sessionId: "second-session" });
+    expect(await client.next()).toMatchObject({ id: 3, result: { sessionId: "second-session" } });
+
+    const replyFirstSent = connection.waitForCommand("Target.attachToTarget");
+    client.send({ id: 4, method: "Target.attachToTarget", params: { flatten: true, targetId: "reply-first" } });
+    await replyFirstSent;
+
+    attachReplies[2]?.resolve({ sessionId: "reply-first-session" });
+    expect(await client.next()).toMatchObject({ id: 4, result: { sessionId: "reply-first-session" } });
+
+    emitPageAttach(connection, "reply-first");
+    expect(await client.next()).toMatchObject({ params: { sessionId: "reply-first-session" } });
+
+    expect(listSizedSessionIds(connection)).toEqual([]);
   });
 
   test("closes clients when the upstream connection closes", async () => {
