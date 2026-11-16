@@ -86,6 +86,11 @@ const cachedBundleExists = async (path: string): Promise<boolean> => {
   }
 };
 
+export const FRONTEND_MCP_ENTRYPOINT_FILTER = /[\\/]mcp[\\/]mcp\.ts$/;
+
+export const isFrontendLocalesImporter = (importer: string) =>
+  importer.replaceAll("\\", "/").endsWith("/front_end/core/i18n/i18nImpl.ts");
+
 const buildFrontendBundle = async (destination: string, kind: "heap" | "trace") => {
   const entrypoint = fileURLToPath(import.meta.resolve("chrome-devtools-frontend/mcp/mcp.ts"));
   const result = await Bun.build({
@@ -97,7 +102,7 @@ const buildFrontendBundle = async (destination: string, kind: "heap" | "trace") 
       {
         name: "chrome-devtools-frontend-generated-locales",
         setup(build) {
-          build.onLoad({ filter: /\/mcp\/mcp\.ts$/ }, () => ({
+          build.onLoad({ filter: FRONTEND_MCP_ENTRYPOINT_FILTER }, () => ({
             contents:
               kind === "heap" ?
                 'export * as HeapSnapshotWorker from "../front_end/entrypoints/heap_snapshot_worker/heap_snapshot_worker.js";'
@@ -110,8 +115,8 @@ const buildFrontendBundle = async (destination: string, kind: "heap" | "trace") 
                 ].join("\n"),
             loader: "ts",
           }));
-          build.onResolve({ filter: /\/locales\.js$/ }, (args) => {
-            if (args.path !== "./locales.js" || !args.importer.endsWith("/front_end/core/i18n/i18nImpl.ts")) {
+          build.onResolve({ filter: /[\\/]locales\.js$/ }, (args) => {
+            if (args.path !== "./locales.js" || !isFrontendLocalesImporter(args.importer)) {
               return;
             }
             return { namespace: "chrome-devtools-locales", path: args.path };
@@ -124,6 +129,9 @@ const buildFrontendBundle = async (destination: string, kind: "heap" | "trace") 
       },
     ],
     target: "bun",
+    // Without throw: false, Bun.build rejects with an AggregateError whose message is only "Bundle failed", and
+    // the result.logs check below never runs, so diagnostic tool errors carry none of the build errors.
+    throw: false,
   });
   if (!result.success) {
     const detail = result.logs.map((log) => log.message).join("; ");
