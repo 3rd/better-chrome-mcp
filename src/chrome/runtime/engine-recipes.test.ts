@@ -13,16 +13,14 @@ import {
 
 const absolute = (name: string) => join(tmpdir(), name);
 
-test("defines obscura and lightpanda as headless-only built-ins without a command", () => {
+test("defines obscura and lightpanda as built-ins without a command", () => {
   expect(BUILT_IN_ENGINE_RECIPES).toEqual({
     obscura: {
       args: ["serve", "--port", "{port}", "--storage-dir", "{profileDir}", "--allow-private-network"],
-      headlessOnly: true,
       startupTimeoutMs: 10000,
     },
     lightpanda: {
       args: ["serve", "--host", "127.0.0.1", "--port", "{port}"],
-      headlessOnly: true,
       startupTimeoutMs: 10000,
     },
   });
@@ -45,7 +43,7 @@ test("selects a built-in recipe and lets a file recipe of the same name replace 
   expect(selectEngine("obscura", file)).toEqual({
     kind: "recipe",
     command: absolute("obscura"),
-    engine: { name: "obscura", args: ["--port", "{port}"], headlessOnly: true, startupTimeoutMs: 10000 },
+    engine: { name: "obscura", args: ["--port", "{port}"], startupTimeoutMs: 10000 },
   });
 });
 
@@ -95,7 +93,7 @@ test("rejects unknown keys, a relative command, missing {port}, the chrome name 
 test("expands {port} and {profileDir} inside every argument and keeps shell syntax literal", () => {
   expect(
     expandRecipeArguments(
-      { name: "x", args: ["--port={port}", "{profileDir}/x", "a && b"], headlessOnly: true, startupTimeoutMs: 1 },
+      { name: "x", args: ["--port={port}", "{profileDir}/x", "a && b"], startupTimeoutMs: 1 },
       { port: 9333, profileDir: "C:/p" },
     ),
   ).toEqual(["--port=9333", "C:/p/x", "a && b"]);
@@ -116,7 +114,7 @@ test("reports an unreadable or malformed recipe file", async () => {
   }
 });
 
-test("allows only headless modes for a headless-only engine and never the virtual display", () => {
+test("allows an engine only the headless and attached modes", () => {
   const OBSCURA = { name: "obscura", ...BUILT_IN_ENGINE_RECIPES.obscura };
   for (const mode of ["isolated", "shared", "isolated-virtual-display"] as const) {
     expect(() => assertEngineSupportsMode(OBSCURA, mode)).toThrow(
@@ -126,11 +124,6 @@ test("allows only headless modes for a headless-only engine and never the virtua
   for (const mode of ["isolated-headless", "shared-headless", "main", "remote"] as const) {
     expect(() => assertEngineSupportsMode(OBSCURA, mode)).not.toThrow();
   }
-  const visible = { ...OBSCURA, headlessOnly: false };
-  expect(() => assertEngineSupportsMode(visible, "isolated")).not.toThrow();
-  expect(() => assertEngineSupportsMode(visible, "isolated-virtual-display")).toThrow(
-    "cannot run isolated-virtual-display",
-  );
   expect(() => assertEngineSupportsMode(undefined, "isolated")).not.toThrow();
 });
 

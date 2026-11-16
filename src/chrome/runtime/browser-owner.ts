@@ -81,6 +81,7 @@ import { PWA_INSTALL_RECEIPT_FILE, PwaController, readPwaReceipts } from "./pwa-
 import { ReactInspectionManager } from "./react-inspection-manager";
 import {
   RECIPE_CLOSE_GRACE_MS,
+  type RecipeBrowserHandle,
   type RecipeBrowserLauncher,
   recipeBrowserLauncher,
   stopRecipeProcessTreeByPid,
@@ -162,12 +163,16 @@ export type BrowserOwnerSnapshot = Readonly<{
 
 export type BrowserOwnerCloseResource = "browser" | "default-context";
 
+type OwnerLaunchHandle =
+  | (LaunchedBrowserHandle & Readonly<{ kind: "chrome" }>)
+  | (RecipeBrowserHandle & Readonly<{ kind: "recipe" }>);
+
 type OpenedBrowser = Readonly<{
   adopted: boolean;
   browserPid?: number;
   connection: CdpClient;
   generation: number;
-  launchHandle?: LaunchedBrowserHandle;
+  launchHandle?: OwnerLaunchHandle;
   profileLease?: ProfileLease;
 }>;
 
@@ -254,14 +259,14 @@ const signalProcessIfPresent = (
 };
 
 const closeLaunchedBrowser = async (
-  handle: LaunchedBrowserHandle,
+  handle: OwnerLaunchHandle,
   connection: CdpClient,
   metadata: BrowserOwnerMetadata | undefined,
   options: BrowserOwnerOptions,
 ): Promise<void> => {
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
-    if (handle.recipe) {
+    if (handle.kind === "recipe") {
       // handle.close() stops the process tree whether or not the engine honored Browser.close.
       await connection.send("Browser.close", {}, undefined, 5000).catch(() => undefined);
     }
@@ -319,18 +324,30 @@ const validateSharedProfile = async (options: BrowserOwnerOptions): Promise<void
   }
 };
 
+// The caller verified that the PID still has its recorded identity. The new browser starts on the same profile
+// folder right after this returns, so the old process must be gone first, not merely signalled.
+const stopReplacedEngine = async (
+  prior: BrowserOwnerMetadata,
+  processIdentity: ProcessIdentityProbe,
+  timeoutMs: number | undefined,
+) => {
+  if (prior.browserPid === process.pid) {
+    throw new ChromeRuntimeError(
+      "CHROME_MCP_INVALID_PROFILE_METADATA",
+      "Chrome owner metadata names the broker itself as the browser process",
+    );
+  }
+
+  await stopRecipeProcessTreeByPid(prior.browserPid);
+  await waitForExactProcessExit(prior.browserPid, prior.processStartIdentity, { processIdentity, timeoutMs });
+};
+
 const tryAdoptSharedBrowser = async (
   options: BrowserOwnerOptions,
   connector: CdpConnector,
   prior: BrowserOwnerMetadata | undefined,
 ): Promise<CdpClient | undefined> => {
   if (!isSharedMode(options.key.mode) || !prior || prior.cleanShutdown) return undefined;
-  if (
-    prior.engine !== options.engine?.name ||
-    prior.enginePath !== (options.engine ? options.executablePath : undefined)
-  ) {
-    return undefined;
-  }
   if (
     prior.mode !== options.key.mode ||
     prior.profilePathHash !== profilePathHash(options.paths.userDataDir)
@@ -340,10 +357,10 @@ const tryAdoptSharedBrowser = async (
       "Chrome owner metadata does not match its profile",
     );
   }
-  const processState = await (options.processIdentity ?? probeProcessIdentity)(
-    prior.browserPid,
-    prior.processStartIdentity,
-  );
+
+  const processIdentity = options.processIdentity ?? probeProcessIdentity;
+
+  const processState = await processIdentity(prior.browserPid, prior.processStartIdentity);
   if (processState === "absent" || processState === "different") return undefined;
   if (processState === "unknown") {
     throw new ChromeRuntimeError(
@@ -351,6 +368,16 @@ const tryAdoptSharedBrowser = async (
       `Chrome profile still names live PID ${prior.browserPid}, but its exact identity cannot be verified`,
     );
   }
+
+  const matchesPriorProgram =
+    prior.engine === options.engine?.name &&
+    prior.enginePath === (options.engine ? options.executablePath : undefined);
+  if (!matchesPriorProgram) {
+    await stopReplacedEngine(prior, processIdentity, options.processExitWaitMs);
+
+    return undefined;
+  }
+
   try {
     return await connector(prior.endpoint, 5000);
   } catch (error: unknown) {
@@ -411,7 +438,7 @@ const openBrowser = async (options: BrowserOwnerOptions): Promise<OpenedBrowser>
   }
 
   let lease = options.transferredProfileLease;
-  let launchHandle: LaunchedBrowserHandle | undefined;
+  let launchHandle: OwnerLaunchHandle | undefined;
   let connection: CdpClient | undefined;
   try {
     await validateSharedProfile(options);
@@ -444,8 +471,9 @@ const openBrowser = async (options: BrowserOwnerOptions): Promise<OpenedBrowser>
         engine: options.engine,
         profileDir: options.paths.userDataDir,
       });
-      launchHandle = recipeHandle;
+      launchHandle = { kind: "recipe", ...recipeHandle };
       connection = await connector(recipeHandle.recipe.endpoint);
+
       return Object.freeze({
         adopted: false,
         browserPid: recipeHandle.recipe.browserPid,
@@ -459,7 +487,7 @@ const openBrowser = async (options: BrowserOwnerOptions): Promise<OpenedBrowser>
     await assertChromeExecutable(options.executablePath);
     await prepareLaunchProfile(options.paths.userDataDir, options.paths.downloadsPath);
     const launcher = options.launcher ?? (await loadPlaywrightBrowserLauncher());
-    launchHandle = await launcher.launch(
+    const chromeHandle = await launcher.launch(
       modeLaunchOptions({
         mode: options.key.mode,
         executablePath: options.executablePath,
@@ -468,8 +496,11 @@ const openBrowser = async (options: BrowserOwnerOptions): Promise<OpenedBrowser>
         nativeDeviceScaleFactor: options.nativeDeviceScaleFactor,
       }),
     );
+    launchHandle = { kind: "chrome", ...chromeHandle };
+
     const endpoint = await waitForDevToolsEndpoint(options.paths.userDataDir);
     connection = await connector(endpoint);
+
     return Object.freeze({
       adopted: false,
       connection,
@@ -543,10 +574,7 @@ export class BrowserOwner {
   #closed = false;
   #closePromise: Promise<void> | undefined;
   #closing = false;
-  #clientViewportTargets = new Set<string>();
-  #defaultViewportUnavailable = false;
-  #defaultViewports = new Map<string, Promise<void>>();
-  #launchHandle: LaunchedBrowserHandle | undefined;
+  #launchHandle: OwnerLaunchHandle | undefined;
   #viewportConnection: ReturnType<typeof connectPageViewportController> | undefined;
   #workerScope: ReturnType<CdpRelay["createScope"]> | undefined;
   #metadata: BrowserOwnerMetadata | undefined;
@@ -575,13 +603,18 @@ export class BrowserOwner {
     this.react = new ReactInspectionManager(opened.connection, options.onError);
 
     this.pwa = new PwaController({
-      sendCommand: opened.launchHandle?.sendPwaCommand,
+      sendCommand: opened.launchHandle?.kind === "chrome" ? opened.launchHandle.sendPwaCommand : undefined,
       mode: this.key.mode,
       receiptPath: join(this.paths.profileRoot, PWA_INSTALL_RECEIPT_FILE),
       resolvePageTarget: (targetId, signal) => this.observer.resolvePwaPageTarget(targetId, signal),
     });
 
-    this.relay = CdpRelay.listen(opened.connection, (targetId) => this.registry.unavailableReason(targetId));
+    this.relay = CdpRelay.listen(opened.connection, {
+      // Only recipe engines need the relay to size pages: Chrome's headless pages already get this size from the
+      // launcher's Playwright context, and Chrome's headed modes must keep using the window as the viewport.
+      ...(options.engine ? { defaultViewport: HEADLESS_VIEWPORT } : {}),
+      unavailableTarget: (targetId) => this.registry.unavailableReason(targetId),
+    });
     this.observer = new ChromeTargetObserver({
       activeConnectionId: () => {
         const connectionId = this.#activeConnectionId;
@@ -600,7 +633,6 @@ export class BrowserOwner {
         if (record) this.selections.onTargetClosed(record);
         this.react.closeTarget(targetId).catch(this.#onError);
       },
-      ...(options.engine ? { onTargetReady: (targetId: string) => this.#applyDefaultViewport(targetId) } : {}),
       registry: this.registry,
     });
     opened.profileLease?.waitForFailure().then((error) => {
@@ -623,7 +655,6 @@ export class BrowserOwner {
       await owner.observer.start();
       if (!isAttachedMode(options.key.mode)) await owner.observer.enableOwnedDownloads(options.paths.downloadsPath);
       await owner.observer.ensurePage();
-      await Promise.all(owner.#defaultViewports.values());
       await owner.#recordOpenMetadata();
 
       return owner;
@@ -688,16 +719,6 @@ export class BrowserOwner {
 
   async pageViewport(request: PageViewportRequest, signal: AbortSignal) {
     signal.throwIfAborted();
-    if (request.operation === "set") {
-      this.#clientViewportTargets.add(request.targetId);
-      await this.#defaultViewports.get(request.targetId);
-      signal.throwIfAborted();
-    }
-
-    return this.#runPageViewport(request, signal);
-  }
-
-  async #runPageViewport(request: PageViewportRequest, signal: AbortSignal) {
     const targetClosed = new AbortController();
     const remove = this.connection.on("Target.targetDestroyed", (params) => {
       if (cdpRecord(params)?.targetId === request.targetId) {
@@ -717,7 +738,7 @@ export class BrowserOwner {
       }
       this.registry.requireReady(target);
 
-      let controller = this.#launchHandle?.pageViewport;
+      let controller = this.#launchHandle?.kind === "chrome" ? this.#launchHandle.pageViewport : undefined;
       if (!controller) {
         this.#viewportConnection ??= (this.#options.viewportConnector ?? connectPageViewportController)(
           this.relay.endpoint,
@@ -731,28 +752,15 @@ export class BrowserOwner {
         }
       }
 
-      return await controller(request, AbortSignal.any([signal, targetClosed.signal]));
+      const viewport = await controller(request, AbortSignal.any([signal, targetClosed.signal]));
+
+      // The relay sizes an engine's pages with raw CDP that the controller's Playwright never sees, so a page no client
+      // resized reads as unsized. Reporting the relay's size makes each worker apply it through its own Playwright, as
+      // it does for Chrome, so scripts can read it.
+      return viewport ?? this.relay.defaultViewport ?? null;
     } finally {
       remove();
     }
-  }
-
-  #applyDefaultViewport(targetId: string): void {
-    if (this.#defaultViewportUnavailable || this.#clientViewportTargets.has(targetId)) return;
-    const signal = AbortSignal.timeout(5000);
-    const apply = async () => {
-      try {
-        const stored = await this.#runPageViewport({ operation: "read", targetId }, signal);
-        if (stored || this.#clientViewportTargets.has(targetId)) return;
-        await this.#runPageViewport({ operation: "set", targetId, viewport: HEADLESS_VIEWPORT }, signal);
-      } catch {
-        this.#defaultViewportUnavailable = true;
-      }
-    };
-    const pending = apply().finally(() => {
-      if (this.#defaultViewports.get(targetId) === pending) this.#defaultViewports.delete(targetId);
-    });
-    this.#defaultViewports.set(targetId, pending);
   }
 
   async #disconnectViewport() {

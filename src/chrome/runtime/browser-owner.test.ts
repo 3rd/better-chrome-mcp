@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import type { DownloadFinishedInput } from "./target-observer";
 import { type BrowserLauncher, HEADLESS_VIEWPORT, type LaunchChromeOptions } from "./browser-launcher";
 import { BrowserOwner, ChromeBrowserBroker, type ChromeBrowserBrokerOptions } from "./browser-owner";
+import type { CdpRelay } from "./cdp-relay";
 import { BUILT_IN_ENGINE_RECIPES } from "./engine-recipes";
 import { FakeCdpClient } from "./fake-cdp-client.test-support";
 import { writeBrowserOwnerMetadata } from "./owner-metadata";
@@ -1781,10 +1782,49 @@ describe("BrowserOwner download attribution", () => {
 const OBSCURA = { name: "obscura", ...BUILT_IN_ENGINE_RECIPES.obscura };
 const RECIPE_ENDPOINT = "ws://127.0.0.1:9555/devtools/browser/recipe";
 
-const idleViewportConnector: NonNullable<ChromeBrowserBrokerOptions["viewportConnector"]> = async () => ({
-  pageViewport: async () => null,
-  disconnect: async () => undefined,
-});
+const readRelayMessage = (socket: WebSocket) => {
+  return new Promise<unknown>((resolve) => {
+    socket.addEventListener("message", (event) => resolve(JSON.parse(String(event.data))), { once: true });
+  });
+};
+
+const attachPageThroughRelay = async (relay: CdpRelay, connections: readonly FakeCdpClient[]) => {
+  const connection = connections[0];
+  if (!connection) throw new Error("the browser connection was not opened");
+  const command = connection.command;
+
+  connection.command = async (input) => {
+    if (input.method === "Target.attachToBrowserTarget") return { sessionId: "relay-browser" };
+    return command(input);
+  };
+
+  const socket = new WebSocket(relay.endpoint);
+  await new Promise((resolve) => socket.addEventListener("open", resolve, { once: true }));
+
+  try {
+    const versionReply = readRelayMessage(socket);
+    socket.send(JSON.stringify({ id: 1, method: "Browser.getVersion" }));
+    await versionReply;
+
+    const attachEvent = readRelayMessage(socket);
+    connection.emit(
+      "Target.attachedToTarget",
+      {
+        sessionId: "relay-page",
+        targetInfo: { targetId: "relay-target", type: "page", url: "about:blank" },
+        waitingForDebugger: true,
+      },
+      "relay-browser",
+    );
+    await attachEvent;
+  } finally {
+    socket.close();
+  }
+
+  return connection.commands.filter(
+    (entry) => entry.method === "Emulation.setDeviceMetricsOverride" && entry.sessionId === "relay-page",
+  );
+};
 
 const recipeFixture = (events: string[], pid = process.pid) => {
   const launches: RecipeLaunchOptions[] = [];
@@ -1803,11 +1843,7 @@ const recipeFixture = (events: string[], pid = process.pid) => {
 };
 
 const recipeBroker = async (
-  config: Readonly<{
-    onError?: (error: unknown) => void;
-    secondPage?: boolean;
-    viewportConnector?: ChromeBrowserBrokerOptions["viewportConnector"];
-  }> = {},
+  config: Readonly<{ viewportConnector?: ChromeBrowserBrokerOptions["viewportConnector"] }> = {},
 ) => {
   const workspacePath = await temporaryDirectory("chrome-recipe-workspace-");
   const runtimeRoot = await temporaryDirectory("chrome-recipe-runtime-");
@@ -1815,31 +1851,27 @@ const recipeBroker = async (
   const { launches, launcher } = recipeFixture(events);
   const endpoints: string[] = [];
   const connections: FakeCdpClient[] = [];
-  const targets = new Map<string, TestPageTarget>();
-  if (config.secondPage) {
-    targets.set("page-0", { targetId: "page-0", title: "Initial", type: "page", url: "about:blank" });
-  }
   const broker = await ChromeBrowserBroker.create({
     cdpConnector: async (endpoint) => {
       endpoints.push(endpoint);
-      const connection = pageConnection(endpoint, "page-1", process.pid, () => events.push("Browser.close"), targets);
+      const connection = pageConnection(endpoint, "page-1", process.pid, () => events.push("Browser.close"));
       connections.push(connection);
       return connection;
     },
     engine: OBSCURA,
     env: {},
     executablePath: process.execPath,
-    onError: config.onError ?? (() => undefined),
+    onError: () => undefined,
     pathOptions: { dataHome: runtimeRoot, runtimeRoot },
     recipeLauncher: launcher,
-    viewportConnector: config.viewportConnector ?? idleViewportConnector,
+    ...(config.viewportConnector ? { viewportConnector: config.viewportConnector } : {}),
     workspacePath,
   });
   return { broker, connections, endpoints, events, launches, runtimeRoot };
 };
 
 describe("recipe engine owner", () => {
-  test("refuses a visible mode for a headless-only engine before launching anything", async () => {
+  test("refuses a visible mode for an engine before launching anything", async () => {
     const { broker, launches } = await recipeBroker();
     await expect(broker.acquire("client-a", "isolated")).rejects.toMatchObject({
       code: "CHROME_MCP_ENGINE_UNSUPPORTED_MODE",
@@ -1878,161 +1910,97 @@ describe("recipe engine owner", () => {
     expect(events).toEqual(["Browser.close", "stop"]);
   });
 
-  test("adopts a running shared-headless recipe browser only when the engine name and command match", async () => {
+  test("adopts a running shared-headless recipe browser whose engine name and command match", async () => {
     const workspacePath = await temporaryDirectory("chrome-recipe-adopt-workspace-");
     const runtimeRoot = await temporaryDirectory("chrome-recipe-adopt-runtime-");
     const priorEndpoint = "ws://127.0.0.1:9666/devtools/browser/prior";
-    const make = async () => {
-      const events: string[] = [];
-      const { launches, launcher } = recipeFixture(events);
-      const endpoints: string[] = [];
-      const broker = await ChromeBrowserBroker.create({
-        cdpConnector: async (endpoint) => {
-          endpoints.push(endpoint);
-          return pageConnection(endpoint, "page-1", process.pid, () => events.push("Browser.close"));
-        },
-        engine: OBSCURA,
-        env: {},
-        executablePath: process.execPath,
-        onError: () => undefined,
-        pathOptions: { dataHome: runtimeRoot, runtimeRoot },
-        processIdentity: async () => (events.includes("Browser.close") ? "absent" : "same"),
-        recipeLauncher: launcher,
-        viewportConnector: idleViewportConnector,
-        workspacePath,
-      });
-      return { broker, endpoints, launches };
-    };
-    const writePrior = async (broker: ChromeBrowserBroker, enginePath: string) => {
-      const key = createOwnerKey("shared-headless", broker.workspaceHash, "x");
-      const paths = resolveChromeRuntimePaths(key, {
-        dataHome: runtimeRoot,
-        engineName: "obscura",
-        runtimeRoot,
-      });
-      await writeBrowserOwnerMetadata(paths.ownerMetadataPath, {
-        browserPid: process.pid,
-        cleanShutdown: false,
-        endpoint: priorEndpoint,
-        engine: "obscura",
-        enginePath,
-        mode: "shared-headless",
-        ownerGeneration: 1,
-        processStartIdentity: await currentProcessStartIdentity(),
-        profilePathHash: profilePathHash(paths.userDataDir),
-        updatedAt: new Date().toISOString(),
-      });
-    };
+    const events: string[] = [];
+    const { launches, launcher } = recipeFixture(events);
+    const endpoints: string[] = [];
 
-    const matching = await make();
-    await writePrior(matching.broker, process.execPath);
-    const adopted = await matching.broker.acquire("client-a", "shared-headless");
-    expect(matching.launches).toHaveLength(0);
-    expect(matching.endpoints[0]).toBe(priorEndpoint);
-    await adopted.close();
-    await matching.broker.close();
-
-    const mismatched = await make();
-    await writePrior(mismatched.broker, join(tmpdir(), "other-obscura"));
-    const launched = await mismatched.broker.acquire("client-a", "shared-headless");
-    expect(mismatched.launches).toHaveLength(1);
-    await launched.close();
-    await mismatched.broker.close();
-  });
-
-  test("applies the 1920x1080 headless viewport to new recipe pages through the endpoint controller", async () => {
-    const requests: unknown[] = [];
-    const { broker } = await recipeBroker({
-      viewportConnector: async () => ({
-        pageViewport: async (request) => {
-          requests.push(request);
-          return null;
-        },
-        disconnect: async () => undefined,
-      }),
-    });
-    const session = await broker.acquire("client-a", "isolated-headless");
-    const expected = { operation: "set", targetId: "page-1", viewport: { width: 1920, height: 1080 } };
-    for (let attempt = 0; attempt < 100 && !requests.some((r) => Bun.deepEquals(r, expected)); attempt++) {
-      await Bun.sleep(10);
-    }
-    expect(requests).toContainEqual(expected);
-    await session.close();
-    await broker.close();
-  });
-
-  test("has the default viewport on the initial recipe page before the owner is created", async () => {
-    const stored = new Map<string, unknown>();
-    const { broker } = await recipeBroker({
-      viewportConnector: async () => ({
-        pageViewport: async (request) => {
-          if (request.operation === "read") return (stored.get(request.targetId) as never) ?? null;
-          await Bun.sleep(50);
-          stored.set(request.targetId, request.viewport);
-          return request.viewport;
-        },
-        disconnect: async () => undefined,
-      }),
-    });
-    const session = await broker.acquire("client-a", "isolated-headless");
-    expect(stored.get("page-1")).toEqual({ width: 1920, height: 1080 });
-    await session.close();
-    await broker.close();
-  });
-
-  test("does not overwrite a client viewport with the delayed default on a later recipe page", async () => {
-    const stored = new Map<string, unknown>();
-    const writes: unknown[] = [];
-    let holdDefault: (() => void) | undefined;
-    const defaultHeld = new Promise<void>((resolve) => {
-      holdDefault = resolve;
-    });
-    const { broker, connections } = await recipeBroker({
-      viewportConnector: async () => ({
-        pageViewport: async (request) => {
-          if (request.operation === "read") {
-            if (request.targetId === "blank-1") await defaultHeld;
-            return (stored.get(request.targetId) as never) ?? null;
-          }
-          if (request.targetId === "blank-1" && request.viewport.width === 1920) await defaultHeld;
-          writes.push(request.viewport);
-          stored.set(request.targetId, request.viewport);
-          return request.viewport;
-        },
-        disconnect: async () => undefined,
-      }),
-    });
-    const session = await broker.acquire("client-a", "isolated-headless");
-    await connections[0]?.send("Target.createTarget", { url: "about:blank" });
-    const client = { height: 600, width: 800 };
-    const clientSet = session.owner.pageViewport(
-      { operation: "set", targetId: "blank-1", viewport: client },
-      new AbortController().signal,
-    );
-    await clientSet;
-    holdDefault?.();
-    await Bun.sleep(50);
-    expect(stored.get("blank-1")).toEqual(client);
-    expect(writes).toEqual([{ width: 1920, height: 1080 }, client]);
-    await session.close();
-    await broker.close();
-  });
-
-  test("keeps the engine's default viewport after the endpoint controller fails once", async () => {
-    let connectorCalls = 0;
-    const errors: unknown[] = [];
-    const { broker } = await recipeBroker({
-      onError: (error) => errors.push(error),
-      secondPage: true,
-      viewportConnector: async () => {
-        connectorCalls++;
-        throw new Error("viewport controller unavailable");
+    const broker = await ChromeBrowserBroker.create({
+      cdpConnector: async (endpoint) => {
+        endpoints.push(endpoint);
+        return pageConnection(endpoint, "page-1", process.pid, () => events.push("Browser.close"));
       },
+      engine: OBSCURA,
+      env: {},
+      executablePath: process.execPath,
+      onError: () => undefined,
+      pathOptions: { dataHome: runtimeRoot, runtimeRoot },
+      processIdentity: async () => (events.includes("Browser.close") ? "absent" : "same"),
+      recipeLauncher: launcher,
+      workspacePath,
+    });
+
+    const key = createOwnerKey("shared-headless", broker.workspaceHash, "x");
+    const paths = resolveChromeRuntimePaths(key, { dataHome: runtimeRoot, engineName: "obscura", runtimeRoot });
+    await writeBrowserOwnerMetadata(paths.ownerMetadataPath, {
+      browserPid: process.pid,
+      cleanShutdown: false,
+      endpoint: priorEndpoint,
+      engine: "obscura",
+      enginePath: process.execPath,
+      mode: "shared-headless",
+      ownerGeneration: 1,
+      processStartIdentity: await currentProcessStartIdentity(),
+      profilePathHash: profilePathHash(paths.userDataDir),
+      updatedAt: new Date().toISOString(),
+    });
+
+    const adopted = await broker.acquire("client-a", "shared-headless");
+    expect(launches).toHaveLength(0);
+    expect(endpoints[0]).toBe(priorEndpoint);
+    await adopted.close();
+    await broker.close();
+  });
+
+  test("sizes the pages an engine's clients attach to at 1920x1080", async () => {
+    const { broker, connections } = await recipeBroker();
+    const session = await broker.acquire("client-a", "isolated-headless");
+
+    const sizeCommands = await attachPageThroughRelay(session.owner.relay, connections);
+
+    expect(sizeCommands).toHaveLength(1);
+    expect(sizeCommands[0]?.params).toMatchObject({ height: 1080, mobile: false, width: 1920 });
+    await session.close();
+    await broker.close();
+  });
+
+  test("reports 1920x1080 for an engine page no client resized", async () => {
+    const { broker } = await recipeBroker({
+      viewportConnector: async () => ({ pageViewport: async () => null, disconnect: async () => undefined }),
     });
     const session = await broker.acquire("client-a", "isolated-headless");
-    await Bun.sleep(100);
-    expect(connectorCalls).toBe(1);
-    expect(errors).toEqual([]);
+
+    expect(
+      await session.owner.pageViewport({ operation: "read", targetId: "page-1" }, new AbortController().signal),
+    ).toEqual({ height: 1080, width: 1920 });
+
+    await session.close();
+    await broker.close();
+  });
+
+  test("leaves the page size of a Chrome launch to Chrome", async () => {
+    const workspacePath = await temporaryDirectory("chrome-relay-size-workspace-");
+    const runtimeRoot = await temporaryDirectory("chrome-relay-size-runtime-");
+    const connections: FakeCdpClient[] = [];
+    const chrome = writingLauncher(connections);
+    const broker = await ChromeBrowserBroker.create({
+      cdpConnector: chrome.connector,
+      env: {},
+      executablePath: process.execPath,
+      launcher: chrome.launcher,
+      onError: () => undefined,
+      pathOptions: { dataHome: runtimeRoot, runtimeRoot },
+      workspacePath,
+    });
+    const session = await broker.acquire("client-a", "isolated");
+
+    expect(
+      await session.owner.pageViewport({ operation: "read", targetId: "page-1" }, new AbortController().signal),
+    ).toBeNull();
+    expect(await attachPageThroughRelay(session.owner.relay, connections)).toEqual([]);
     await session.close();
     await broker.close();
   });
@@ -2054,7 +2022,6 @@ describe("recipe engine owner", () => {
       onError: () => undefined,
       pathOptions: { dataHome: runtimeRoot, runtimeRoot },
       recipeLauncher: launcher,
-      viewportConnector: idleViewportConnector,
       workspacePath,
     });
     const main = await mainBroker.acquire("client-a", "main");
@@ -2106,7 +2073,6 @@ describe("remote mode", () => {
       onError: () => undefined,
       pathOptions: { dataHome: runtimeRoot, runtimeRoot },
       recipeLauncher: launcher,
-      viewportConnector: idleViewportConnector,
       workspacePath,
     });
     const session = await broker.acquire("client-a", "remote");
@@ -2163,7 +2129,6 @@ describe("remote mode", () => {
       executablePath: process.execPath,
       onError: () => undefined,
       pathOptions: { dataHome: runtimeRoot, runtimeRoot },
-      viewportConnector: idleViewportConnector,
       workspacePath,
     });
     try {
@@ -2187,7 +2152,6 @@ describe("remote mode", () => {
         executablePath: process.execPath,
         onError: () => undefined,
         pathOptions: { dataHome: runtimeRoot, runtimeRoot },
-        viewportConnector: idleViewportConnector,
         workspacePath,
       });
     const refused = await make(() => Promise.reject(new Error("connection refused")));
@@ -2220,7 +2184,6 @@ describe("remote mode", () => {
       executablePath: process.execPath,
       onError: () => undefined,
       pathOptions: { dataHome: runtimeRoot, runtimeRoot },
-      viewportConnector: idleViewportConnector,
       workspacePath,
     });
     const rejection = await broker.acquire("client-a", "remote").then(
@@ -2257,7 +2220,6 @@ describe("recipe engine owner with a real engine process", () => {
   const stubborn = {
     name: "obscura",
     args: [FAKE_ENGINE, "--port", "{port}", "--storage-dir", "{profileDir}", "--behavior", "ignore-close", "--spawn-child"],
-    headlessOnly: true,
     startupTimeoutMs: 10_000,
   };
   const fastLauncher: RecipeBrowserLauncher = {
@@ -2298,7 +2260,6 @@ describe("recipe engine owner with a real engine process", () => {
       recipeLauncher: fastLauncher,
       // The PID fallback must not be what stops the engine: handle.close() has to run.
       signalProcess: () => undefined,
-      viewportConnector: idleViewportConnector,
       workspacePath,
     });
     const session = await broker.acquire("client-a", "isolated-headless");
@@ -2331,7 +2292,6 @@ describe("recipe engine owner with a real engine process", () => {
       onError: () => undefined,
       pathOptions: { dataHome: runtimeRoot, runtimeRoot },
       recipeLauncher: fastLauncher,
-      viewportConnector: idleViewportConnector,
       workspacePath,
     });
     const key = createOwnerKey("shared-headless", broker.workspaceHash, "x");
@@ -2372,6 +2332,70 @@ describe("recipe engine owner with a real engine process", () => {
     }
   }, 30_000);
 
+  test("stops a running shared-headless engine whose program changed before starting its replacement", async () => {
+    const workspacePath = await temporaryDirectory("chrome-recipe-replace-workspace-");
+    const runtimeRoot = await temporaryDirectory("chrome-recipe-replace-runtime-");
+
+    const broker = await ChromeBrowserBroker.create({
+      cdpConnector: async (endpoint) => pageConnection(endpoint, "page-1"),
+      engine: stubborn,
+      env: {},
+      executablePath: process.execPath,
+      onError: () => undefined,
+      pathOptions: { dataHome: runtimeRoot, runtimeRoot },
+      recipeLauncher: fastLauncher,
+      workspacePath,
+    });
+
+    const key = createOwnerKey("shared-headless", broker.workspaceHash, "x");
+    const paths = resolveChromeRuntimePaths(key, { dataHome: runtimeRoot, engineName: "obscura", runtimeRoot });
+    const first = await launchRecipeBrowser({
+      command: process.execPath,
+      engine: stubborn,
+      profileDir: paths.userDataDir,
+    });
+    const prior = await readRecord(paths.userDataDir);
+    const leakedPids = [prior.pid, prior.childPid];
+
+    try {
+      await writeBrowserOwnerMetadata(paths.ownerMetadataPath, {
+        browserPid: prior.pid,
+        cleanShutdown: false,
+        endpoint: first.recipe.endpoint,
+        engine: "obscura",
+        enginePath: join(tmpdir(), "previous-obscura"),
+        mode: "shared-headless",
+        ownerGeneration: 1,
+        processStartIdentity: await currentProcessStartIdentity(prior.pid),
+        profilePathHash: profilePathHash(paths.userDataDir),
+        updatedAt: new Date().toISOString(),
+      });
+
+      const session = await broker.acquire("client-a", "shared-headless");
+      const replacement = await readRecord(paths.userDataDir);
+      leakedPids.push(replacement.pid, replacement.childPid);
+
+      await waitUntilGone(prior.childPid);
+      expect(isRunning(prior.pid)).toBe(false);
+      expect(isRunning(prior.childPid)).toBe(false);
+
+      expect(replacement.pid).not.toBe(prior.pid);
+      expect(JSON.parse(await readFile(paths.ownerMetadataPath, "utf8"))).toMatchObject({
+        browserPid: replacement.pid,
+        enginePath: process.execPath,
+      });
+
+      await session.close();
+      await broker.close();
+    } finally {
+      for (const leaked of leakedPids) {
+        if (isRunning(leaked)) process.kill(leaked, "SIGKILL");
+      }
+
+      await first.close().catch(() => undefined);
+    }
+  }, 30_000);
+
   test("does not stop the process tree of an adopted engine whose identity changed after the grace wait", async () => {
     const workspacePath = await temporaryDirectory("chrome-recipe-reuse-workspace-");
     const runtimeRoot = await temporaryDirectory("chrome-recipe-reuse-runtime-");
@@ -2398,7 +2422,6 @@ describe("recipe engine owner with a real engine process", () => {
       pathOptions: { dataHome: runtimeRoot, runtimeRoot },
       processIdentity,
       recipeLauncher: fastLauncher,
-      viewportConnector: idleViewportConnector,
       workspacePath,
     });
     const key = createOwnerKey("shared-headless", broker.workspaceHash, "x");

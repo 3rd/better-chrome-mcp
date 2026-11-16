@@ -141,7 +141,6 @@ claude mcp add --transport stdio --scope local chrome-mcp -- bun /absolute/path/
     "obscura": {
       "command": "/absolute/path/to/obscura",
       "args": ["serve", "--port", "{port}", "--storage-dir", "{profileDir}", "--allow-private-network"],
-      "headlessOnly": true,
       "startupTimeoutMs": 10000
     }
   }
@@ -150,13 +149,12 @@ claude mcp add --transport stdio --scope local chrome-mcp -- bun /absolute/path/
 
 - `command` is the absolute path of the program. A recipe in a file must have it. `--executable-path` overrides it for the selected engine.
 - `args` is an array of strings, run without a shell. `{port}` is required. `{profileDir}` is optional.
-- `headlessOnly` defaults to `true`.
 - `startupTimeoutMs` defaults to `10000`.
 - Unknown keys and unknown placeholders fail at start. The whole file is validated, even when `--engine` names another engine. A file cannot override the `chrome` name.
 
-An engine that is headless only supports `isolated-headless` and `shared-headless`. Its other launched modes return `CHROME_MCP_ENGINE_UNSUPPORTED_MODE`. The `main` mode always attaches to the user's own Chrome and ignores `--engine`. The profiles of a recipe engine live under `profiles/<engine>/<workspace hash>/<mode>`, apart from Chrome's.
+A recipe engine runs headless only, because a recipe starts the same way for every mode: it supports `isolated-headless` and `shared-headless`, and its other launched modes return `CHROME_MCP_ENGINE_UNSUPPORTED_MODE`. The `main` mode always attaches to the user's own Chrome and ignores `--engine`. The profiles of a recipe engine live under `profiles/<engine>/<workspace hash>/<mode>`, apart from Chrome's.
 
-New pages get a 1920x1080 viewport when the engine accepts Playwright's endpoint viewport control. Otherwise the engine keeps its own default.
+Every page of a recipe engine starts with the same 1920x1080 viewport as Chrome's headless modes, set before a script can use the page. An engine that does not implement `Emulation.setDeviceMetricsOverride` keeps its own size.
 
 `--cdp-endpoint <url>` turns on the `remote` mode. The URL is `http(s)://host:port`, read through `/json/version`, or `ws(s)://`. Without it, `remote` returns `CHROME_MCP_REMOTE_UNAVAILABLE`. A non-loopback endpoint gives the agent code execution in that browser, and the server never closes it. Point it only at a browser the user trusts the agent with.
 
@@ -232,7 +230,7 @@ Do these steps in each configured client, with a different `browserInstanceId` i
 
    Expect `ok: true` and `sharedTitle: "MCP shared profile check"`. The call creates the project's persistent `shared-headless` profile, in the folder named under [Diagnose common failures](#diagnose-common-failures), and closes the browser it started. If another session already has this project's shared browser open, the close fails with `CHROME_MCP_BROWSER_CLOSE_FORBIDDEN`; leave that browser open and treat this step as skipped.
 
-With `--engine obscura`, run steps 3 to 5 unchanged. Step 5 (`shared-headless`) also exercises engine-scoped profile adoption.
+With `--engine obscura`, run steps 3 to 5 unchanged. Step 5 (`shared-headless`) also exercises the engine's own profile folder under `profiles/<engine>/`.
 
 ## Diagnose common failures
 
@@ -242,7 +240,7 @@ With `--engine obscura`, run steps 3 to 5 unchanged. Step 5 (`shared-headless`) 
 - **Profile lock or process identity errors:** on Linux, check that `flock` is on `PATH`. On macOS and Windows these use native system calls; reproduce with the platform tests under [Repair from the repository](#repair-from-the-repository). Do not delete another browser's profile, bypass the lock, or replace the identity check with a bare process ID to make startup succeed.
 - **React tools are missing:** the project needs React installed in `node_modules`; a dependency declaration alone is not enough. Check `--workspace`, or pass `--react on`.
 - **React tools appear in a project without React:** pass `--react off`.
-- **An engine fails to start, or a mode returns `CHROME_MCP_ENGINE_UNSUPPORTED_MODE`:** check that `--executable-path` or the recipe's `command` is an absolute path to the engine's program, and that `args` contains `{port}`. A headless-only engine supports `isolated-headless` and `shared-headless` only.
+- **An engine fails to start, or a mode returns `CHROME_MCP_ENGINE_UNSUPPORTED_MODE`:** check that `--executable-path` or the recipe's `command` is an absolute path to the engine's program, and that `args` contains `{port}`. A recipe engine supports only `isolated-headless` and `shared-headless`.
 - **`remote` returns `CHROME_MCP_REMOTE_UNAVAILABLE`, or a call returns `CHROME_MCP_BROKER_UNAVAILABLE`:** pass `--cdp-endpoint` to enable `remote`. The broker keeps the engine, recipe, program, and endpoint of the session that started it, so close every session on the project and wait a few seconds before changing them.
 - **The `main` mode reports `CHROME_MCP_MAIN_UNAVAILABLE`:** remote debugging must be switched on in the user's browser at `chrome://inspect/#remote-debugging`. For a browser other than Google Chrome, pass its profile folder with `--main-user-data-dir`. Sessions on one project that use `main` at the same time need the same folder.
 

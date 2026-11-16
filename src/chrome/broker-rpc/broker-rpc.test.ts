@@ -52,6 +52,7 @@ import {
   type ChromeBrokerClient,
   connectChromeBroker,
   connectOrRetireLockedBroker,
+  calculateSessionAcquireTimeoutMs,
 } from "./client";
 import {
   BROKER_CHILD_CDP_ENDPOINT_ENV,
@@ -82,7 +83,6 @@ import { type BrokerRpcServer, startBrokerRpcServer } from "./server";
 const OBSCURA = {
   name: "obscura",
   args: ["serve", "--port", "{port}", "--storage-dir", "{profileDir}", "--allow-private-network"],
-  headlessOnly: true,
   startupTimeoutMs: 10_000,
 };
 
@@ -2521,5 +2521,9 @@ describe("broker engine and CDP endpoint", () => {
         workspacePath: "/w",
       }),
     ).not.toThrow();
+  });
+
+  test("gives a launched recipe engine longer than its startup timeout to open a session", () => {
+    expect(calculateSessionAcquireTimeoutMs("shared-headless", { ...OBSCURA, startupTimeoutMs: 60_000 })).toBeGreaterThan(60_000);
   });
 });

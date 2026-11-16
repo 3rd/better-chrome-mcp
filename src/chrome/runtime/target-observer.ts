@@ -52,7 +52,6 @@ export type TargetObserverOptions = Readonly<{
   onDownloadFinished?: (input: DownloadFinishedInput) => Promise<DownloadPublication>;
   onError: (error: unknown) => void;
   onTargetClosed?: (targetId: string) => void;
-  onTargetReady?: (targetId: string) => void;
   registry: ChromeTargetRegistry;
 }>;
 
@@ -146,7 +145,6 @@ export class ChromeTargetObserver {
   #onDownloadFinished: TargetObserverOptions["onDownloadFinished"];
   #onError: (error: unknown) => void;
   #onTargetClosed: ((targetId: string) => void) | undefined;
-  #onTargetReady: ((targetId: string) => void) | undefined;
   #pendingTargets = new Map<string, Promise<void>>();
   #mutations: PersistentBrowserMutations | undefined;
   #requestUrls = new Map<string, Readonly<{ targetId: string; url: string }>>();
@@ -167,7 +165,6 @@ export class ChromeTargetObserver {
     this.#onDownloadFinished = options.onDownloadFinished;
     this.#onError = options.onError;
     this.#onTargetClosed = options.onTargetClosed;
-    this.#onTargetReady = options.onTargetReady;
   }
 
   async start(): Promise<void> {
@@ -514,7 +511,6 @@ export class ChromeTargetObserver {
         });
       }
       this.registry.markReady(target.targetId);
-      this.#onTargetReady?.(target.targetId);
     } catch (error: unknown) {
       const unavailable =
         this.browserMode === "main" &&

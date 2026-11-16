@@ -1,8 +1,10 @@
 import { randomBytes } from "node:crypto";
 import type { Server, ServerWebSocket } from "bun";
 
+import type { PageViewportState } from "./page-viewport";
 import type { ChromeTargetRegistry } from "./target-registry";
 import {
+  CDP_METHOD_NOT_FOUND,
   CDP_SERVER_ERROR,
   type CdpClient,
   CdpCommandError,
@@ -43,12 +45,18 @@ type PausedFetchRequest = {
   isAuthChallenge: boolean;
 };
 
+type HeldRelayMessage = Readonly<{ message: Record<string, unknown>; ready: Promise<void> }>;
+
 type RelayClient = {
   browserSessionId: string | undefined;
   closed: boolean;
   crashedSessions: Set<string>;
   excludedSessions: Set<string>;
+  explicitAttachCountsByTargetId: Map<string, number>;
+  explicitSessionIdsAwaitingEvent: Set<string>;
+  explicitSessionIdsAwaitingReply: Set<string>;
   fetchSessions: Set<string>;
+  heldMessages: HeldRelayMessage[];
   pausedRequests: Map<string, Map<string, PausedFetchRequest>>;
   pendingExecutions: Map<number, string>;
   queued: string[];
@@ -57,12 +65,28 @@ type RelayClient = {
   socket: ServerWebSocket<RelayClient> | undefined;
 };
 
+type CdpRelayOptions = Readonly<{
+  defaultViewport?: NonNullable<PageViewportState>;
+  unavailableTarget?: ChromeTargetRegistry["unavailableReason"];
+}>;
+
 const sendRelayReply = (client: RelayClient, message: Record<string, unknown>): void => {
   if (client.closed) {
     return;
   }
   client.socket?.send(JSON.stringify(message));
 };
+
+// The same metrics Playwright sends for a Chrome context viewport, so pages are sized alike on every engine.
+const createDeviceMetricsOverride = (viewport: NonNullable<PageViewportState>) => ({
+  deviceScaleFactor: 1,
+  height: viewport.height,
+  mobile: false,
+  screenHeight: viewport.height,
+  screenOrientation: { angle: 0, type: "landscapePrimary" },
+  screenWidth: viewport.width,
+  width: viewport.width,
+});
 
 export class CdpRelay {
   readonly endpoint: string;
@@ -76,12 +100,15 @@ export class CdpRelay {
   #scopes = new Map<string, RelayScope>();
   #sessionOwners = new Map<string, RelayClient>();
   #stopEvents: () => void;
+  private sizedViewport: NonNullable<PageViewportState> | undefined;
   private unavailableTarget: ChromeTargetRegistry["unavailableReason"] | undefined;
 
-  private constructor(connection: CdpClient, unavailableTarget?: ChromeTargetRegistry["unavailableReason"]) {
+  private constructor(connection: CdpClient, options: CdpRelayOptions) {
     this.#connection = connection;
-    this.unavailableTarget = unavailableTarget;
+    this.sizedViewport = options.defaultViewport;
+    this.unavailableTarget = options.unavailableTarget;
     this.#path = `/cdp/${randomBytes(24).toString("hex")}`;
+
     this.#server = Bun.serve<RelayClient>({
       fetch: (request, server) => this.#fetch(request, server),
       hostname: "127.0.0.1",
@@ -106,11 +133,13 @@ export class CdpRelay {
     connection.waitForClose().then(() => this.close());
   }
 
-  static listen(
-    connection: CdpClient,
-    unavailableTarget?: ChromeTargetRegistry["unavailableReason"],
-  ): CdpRelay {
-    return new CdpRelay(connection, unavailableTarget);
+  static listen(connection: CdpClient, options: CdpRelayOptions = {}): CdpRelay {
+    return new CdpRelay(connection, options);
+  }
+
+  // Undefined when the relay sizes no pages: for Chrome, or for an engine that rejected the size command as unknown.
+  get defaultViewport() {
+    return this.sizedViewport;
   }
 
   get clientCount(): number {
@@ -332,8 +361,12 @@ export class CdpRelay {
       closed: false,
       crashedSessions: new Set(),
       excludedSessions: new Set(),
+      explicitAttachCountsByTargetId: new Map(),
+      explicitSessionIdsAwaitingEvent: new Set(),
+      explicitSessionIdsAwaitingReply: new Set(),
       pendingExecutions: new Map(),
       fetchSessions: new Set(),
+      heldMessages: [],
       pausedRequests: new Map(),
       queued: [],
       scope,
@@ -403,7 +436,7 @@ export class CdpRelay {
     }
     const id = message.id;
     if (typeof message.method !== "string") {
-      sendRelayReply(client, {
+      this.deliverToClient(client, {
         id,
         ...cdpErrorReply(CDP_INVALID_REQUEST, "Message must have string 'method' property"),
       });
@@ -412,7 +445,7 @@ export class CdpRelay {
     const method = message.method;
     const sessionId = typeof message.sessionId === "string" ? message.sessionId : undefined;
     if (sessionId !== undefined && !client.sessions.has(sessionId)) {
-      sendRelayReply(client, { id, ...cdpSessionNotFoundReply(sessionId) });
+      this.deliverToClient(client, { id, ...cdpSessionNotFoundReply(sessionId) });
       return;
     }
 
@@ -420,13 +453,20 @@ export class CdpRelay {
       const targetId = cdpRecord(message.params)?.targetId;
       const unavailable = typeof targetId === "string" ? this.unavailableTarget?.(targetId) : undefined;
       if (unavailable) {
-        sendRelayReply(client, {
+        this.deliverToClient(client, {
           id,
           ...(sessionId === undefined ? {} : { sessionId }),
           ...cdpErrorReply(CDP_SERVER_ERROR, `Chrome target ${targetId} is unavailable: ${unavailable}`),
         });
         return;
       }
+    }
+
+    const explicitAttachTargetId = method === "Target.attachToTarget" ? cdpRecord(message.params)?.targetId : undefined;
+    const tracksExplicitAttach = this.sizedViewport !== undefined && typeof explicitAttachTargetId === "string";
+    if (tracksExplicitAttach) {
+      const count = client.explicitAttachCountsByTargetId.get(explicitAttachTargetId) ?? 0;
+      client.explicitAttachCountsByTargetId.set(explicitAttachTargetId, count + 1);
     }
 
     const upstreamSessionId =
@@ -481,6 +521,10 @@ export class CdpRelay {
             this.#ownSession(client, attachedSessionId);
           }
         }
+
+        if (tracksExplicitAttach) {
+          this.settleExplicitAttachReply(client, explicitAttachTargetId, cdpRecord(reply.result)?.sessionId);
+        }
         if (method === "Target.detachFromTarget" && reply.error === undefined) {
           const detachedSessionId = cdpRecord(message.params)?.sessionId;
           if (typeof detachedSessionId === "string") {
@@ -491,7 +535,7 @@ export class CdpRelay {
         if (sessionId === undefined) {
           delete response.sessionId;
         }
-        sendRelayReply(client, response);
+        this.deliverToClient(client, response);
       },
       isScopedExecution ? null : undefined,
     );
@@ -535,10 +579,12 @@ export class CdpRelay {
       client.crashedSessions.delete(envelope);
     }
 
+    let pageSized: Promise<void> | undefined;
     const childSessionId = cdpRecord(message.params)?.sessionId;
     if (message.method === "Target.attachedToTarget" && typeof childSessionId === "string") {
       const targetInfo = cdpRecord(cdpRecord(message.params)?.targetInfo);
       const targetId = targetInfo?.targetId;
+      const isExplicitAttach = this.matchExplicitAttachEvent(client, childSessionId, targetId);
       const unsupportedPage =
         targetInfo?.type === "page" &&
         typeof targetInfo.url === "string" &&
@@ -558,6 +604,12 @@ export class CdpRelay {
       }
 
       this.#ownSession(client, childSessionId);
+
+      const sizedViewport = this.sizedViewport;
+      const needsDefaultViewport = sizedViewport !== undefined && targetInfo?.type === "page" && !isExplicitAttach;
+      if (needsDefaultViewport) {
+        pageSized = this.sizeAttachedPage(childSessionId, sizedViewport);
+      }
     }
     if (message.method === "Target.detachedFromTarget" && typeof childSessionId === "string") {
       if (client.excludedSessions.delete(childSessionId)) return;
@@ -567,7 +619,93 @@ export class CdpRelay {
     if (envelope !== client.browserSessionId) {
       event.sessionId = envelope;
     }
-    sendRelayReply(client, event);
+    this.deliverToClient(client, event, pageSized);
+  }
+
+  // A client cannot use a page before this attach event reaches it (Playwright's newPage() and pages() wait for it,
+  // and a new page stays paused because Playwright attaches with waitForDebuggerOnStart), so sizing the page first
+  // means a script never sees it at the engine's own size. The attach goes through whatever the reply; an engine
+  // that does not know the command keeps its own size, and the relay stops sizing and reporting a default, because
+  // a worker that applied the reported default through Playwright would fail on the same command.
+  private sizeAttachedPage(sessionId: string, viewport: NonNullable<PageViewportState>) {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    this.#connection.forward(
+      { method: "Emulation.setDeviceMetricsOverride", params: createDeviceMetricsOverride(viewport), sessionId },
+      (reply) => {
+        if (cdpRecord(reply.error)?.code === CDP_METHOD_NOT_FOUND) {
+          this.sizedViewport = undefined;
+        }
+
+        resolve();
+      },
+    );
+
+    return promise;
+  }
+
+  // Sessions a client opens with Target.attachToTarget, such as a raw newCDPSession() or a target lookup, keep the
+  // page's current size: sizing them would replace a size a script set. Chrome sends the attach event before the
+  // command's reply, and other engines may not, so whichever of the two arrives first takes the attach's count and
+  // leaves its session ID for the other. A count cannot tell an explicit attach from an auto-attach of the same target
+  // that is still in flight; Playwright attaches explicitly only to pages it already has.
+  private matchExplicitAttachEvent(client: RelayClient, sessionId: string, targetId: unknown) {
+    if (client.explicitSessionIdsAwaitingEvent.delete(sessionId)) return true;
+    if (typeof targetId !== "string") return false;
+    if (!this.consumeExplicitAttach(client, targetId)) return false;
+
+    client.explicitSessionIdsAwaitingReply.add(sessionId);
+
+    return true;
+  }
+
+  private settleExplicitAttachReply(client: RelayClient, targetId: string, sessionId: unknown) {
+    const hasMatchedEvent = typeof sessionId === "string" && client.explicitSessionIdsAwaitingReply.delete(sessionId);
+    if (hasMatchedEvent) return;
+
+    this.consumeExplicitAttach(client, targetId);
+
+    if (typeof sessionId !== "string") return;
+
+    client.explicitSessionIdsAwaitingEvent.add(sessionId);
+  }
+
+  private consumeExplicitAttach(client: RelayClient, targetId: string) {
+    const count = client.explicitAttachCountsByTargetId.get(targetId);
+    if (count === undefined) return false;
+
+    if (count === 1) {
+      client.explicitAttachCountsByTargetId.delete(targetId);
+    } else {
+      client.explicitAttachCountsByTargetId.set(targetId, count - 1);
+    }
+
+    return true;
+  }
+
+  // Once one message waits for a relay-issued command, every later message to that client waits behind it: a reply
+  // or event that overtook an attach would show the client a session it does not know yet.
+  private deliverToClient(client: RelayClient, message: Record<string, unknown>, ready?: Promise<void>) {
+    const canSendNow = ready === undefined && client.heldMessages.length === 0;
+    if (canSendNow) {
+      sendRelayReply(client, message);
+
+      return;
+    }
+
+    client.heldMessages.push({ message, ready: ready ?? Promise.resolve() });
+
+    const isReleaseRunning = client.heldMessages.length > 1;
+    if (isReleaseRunning) return;
+
+    this.releaseHeldMessages(client);
+  }
+
+  private async releaseHeldMessages(client: RelayClient) {
+    for (let held = client.heldMessages[0]; held; held = client.heldMessages[0]) {
+      await held.ready;
+      client.heldMessages.shift();
+      sendRelayReply(client, held.message);
+    }
   }
 
   #ownSession(client: RelayClient, sessionId: string): void {
@@ -579,6 +717,7 @@ export class CdpRelay {
   #releaseSession(client: RelayClient, sessionId: string): void {
     client.sessions.delete(sessionId);
     client.crashedSessions.delete(sessionId);
+    client.explicitSessionIdsAwaitingEvent.delete(sessionId);
     client.fetchSessions.delete(sessionId);
     client.pausedRequests.delete(sessionId);
     if (this.#sessionOwners.get(sessionId) === client) {
@@ -593,6 +732,7 @@ export class CdpRelay {
     }
     client.closed = true;
     client.queued.length = 0;
+    client.heldMessages.length = 0;
     this.#clients.delete(client);
 
     if (!client.scope) {
@@ -608,6 +748,9 @@ export class CdpRelay {
     client.sessions.clear();
     client.crashedSessions.clear();
     client.excludedSessions.clear();
+    client.explicitAttachCountsByTargetId.clear();
+    client.explicitSessionIdsAwaitingEvent.clear();
+    client.explicitSessionIdsAwaitingReply.clear();
     client.pendingExecutions.clear();
 
     if (client.browserSessionId !== undefined) {

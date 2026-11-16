@@ -1,6 +1,7 @@
 import {
   CDP_SERVER_ERROR,
   type CdpClient,
+  CdpCommandError,
   cdpErrorReply,
   type CdpEventListener,
   type CdpEventMessage,
@@ -69,11 +70,13 @@ export class FakeCdpClient implements CdpClient {
   forward(command: CdpForwardedCommand, reply: CdpForwardReply): void {
     this.send(command.method, cdpRecord(command.params) ?? {}, command.sessionId).then(
       (result) => reply({ result, ...(command.sessionId ? { sessionId: command.sessionId } : {}) }),
-      (error: unknown) =>
+      (error: unknown) => {
+        const browserErrorCode = error instanceof CdpCommandError ? error.code : undefined;
         reply({
-          ...cdpErrorReply(CDP_SERVER_ERROR, error instanceof Error ? error.message : String(error)),
+          ...cdpErrorReply(browserErrorCode ?? CDP_SERVER_ERROR, error instanceof Error ? error.message : String(error)),
           ...(command.sessionId ? { sessionId: command.sessionId } : {}),
-        }),
+        });
+      },
     );
   }
 

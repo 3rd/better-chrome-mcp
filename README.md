@@ -97,6 +97,7 @@ Every browser-selecting call names a browser mode:
 - `isolated-virtual-display`: a temporary browser with a real window on a private Xvfb display, for checking text rendering at the screen's native scale. Linux only.
 - `shared-headless` and `shared`: profiles that persist for the workspace and are shared by every client connected to it, one without a window and one with.
 - `main`: your own running Chrome. It needs Chrome 144 or newer with remote debugging switched on at `chrome://inspect/#remote-debugging`, and Chrome asks you to approve the connection.
+- `remote`: a running browser at the `--cdp-endpoint` [startup option](#startup-options). The server attaches to it and never closes it. The agent's code gets full control of that browser, so point it only at one you trust the agent with.
 
 A first `run_playwright` call names the mode, the browser ID, and the script:
 
@@ -136,7 +137,10 @@ To check your client, ask the model to quote this server's instructions before i
 Pass options after `src/index.ts`, as in the `--workspace` examples under [Connect a client](#connect-a-client).
 
 - `--workspace <path>`: the project folder. Default: the folder the server is started in.
-- `--executable-path <path>`: the Chrome or Chromium program to run. Default: the first one the server finds; see [Which Chrome runs](#which-chrome-runs).
+- `--executable-path <path>`: the Chrome or Chromium program to run, or with `--engine`, the engine's program. Default for Chrome: the first one the server finds; see [Which Chrome runs](#which-chrome-runs).
+- `--engine <name>`: the browser engine to launch: `chrome`, the default, `obscura`, `lightpanda`, or a name from `--engine-config`. Engines other than Chrome run headless only; see [Other browser engines and the remote mode](SETUP.md#other-browser-engines-and-the-remote-mode).
+- `--engine-config <file>`: a JSON file of engine recipes, each with a program and its arguments. A recipe named after a built-in engine replaces that engine's recipe.
+- `--cdp-endpoint <url>`: the `http(s)://` or `ws(s)://` debugging endpoint of a running browser. It turns on the `remote` mode.
 - `--react <auto|on|off>`: whether to offer the React tools. `auto`, the default, offers them when the project that contains the workspace, or a project nested up to four folders below it, has React installed in `node_modules`. `off` keeps them out of the tool list, and `on` offers them regardless.
 - `--main-user-data-dir <path>`: the profile folder of the running browser that the `main` mode attaches to. Default: Google Chrome's own profile folder. Set it for Chromium or another Chrome channel. Sessions on one workspace that use `main` at the same time need the same value.
 - `--help` and `--version`: print the options or the version, then exit.
@@ -147,7 +151,7 @@ The Chrome program comes from `--executable-path`, or from the environment varia
 
 With neither set, the server looks for `google-chrome-stable`, `google-chrome`, `chromium`, and `chromium-browser` on `PATH`. It then looks for Google Chrome and Chromium in the standard install folders: `/Applications` and `~/Applications` on macOS, and `Program Files`, `Program Files (x86)`, and the user's local application data folder on Windows.
 
-Sessions on one workspace share a background process that starts the browsers, and it keeps the Chrome program of the session that started it. After changing the option or the variable, close every client session on that workspace and wait a few seconds before starting a new one.
+Sessions on one workspace share a background process that starts the browsers, and it keeps the Chrome program, engine, and CDP endpoint of the session that started it. A session configured with a different engine, engine program, or CDP endpoint fails with `CHROME_MCP_BROKER_UNAVAILABLE` while that process runs. After changing an option or the variable, close every client session on that workspace and wait a few seconds before starting a new one.
 
 ## Where data is kept
 

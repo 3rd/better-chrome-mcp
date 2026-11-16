@@ -1,10 +1,6 @@
 import { mkdir } from "node:fs/promises";
 import { isNodeError } from "../../platform/node-errors";
-import {
-  chromeProcessEnvironment,
-  type LaunchedBrowserHandle,
-  type RecipeProcessInfo,
-} from "./browser-launcher";
+import { chromeProcessEnvironment } from "./browser-launcher";
 import { fetchWebSocketDebuggerUrl, loopbackEndpoint } from "./devtools-endpoint";
 import { expandRecipeArguments, type RecipeEngine } from "./engine-recipes";
 import { ChromeRuntimeError } from "./errors";
@@ -27,7 +23,12 @@ export type RecipeLaunchOptions = Readonly<{
   sourceEnv?: NodeJS.ProcessEnv;
 }>;
 
-export type RecipeBrowserHandle = LaunchedBrowserHandle & Readonly<{ recipe: RecipeProcessInfo }>;
+export type RecipeProcessInfo = Readonly<{ browserPid: number; endpoint: string; exited: Promise<number> }>;
+
+export type RecipeBrowserHandle = Readonly<{
+  close: () => Promise<void>;
+  recipe: RecipeProcessInfo;
+}>;
 
 export type RecipeBrowserLauncher = Readonly<{
   launch: (options: RecipeLaunchOptions) => Promise<RecipeBrowserHandle>;
@@ -62,17 +63,11 @@ const ignoreNoSuchProcess = (error: unknown) => {
   if (!isNodeError(error, "ESRCH")) throw error;
 };
 
+// Engines start with setsid(), so an engine leads its own process group for life. An empty group means the engine
+// already exited, and its PID may belong to an unrelated process by now, so never fall back to signalling the PID.
 const killGroup = (pid: number, signal: NodeJS.Signals) => {
   try {
     process.kill(-pid, signal);
-    return;
-  } catch (error) {
-    ignoreNoSuchProcess(error);
-  }
-
-  // No group with this ID: an engine that moved itself to another group (setsid/setpgid) still has a live leader.
-  try {
-    process.kill(pid, signal);
   } catch (error) {
     ignoreNoSuchProcess(error);
   }

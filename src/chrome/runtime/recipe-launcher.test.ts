@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,7 +17,6 @@ const FAKE_ENGINE = fileURLToPath(new URL("./fake-cdp-engine.test-support.ts", i
 const fakeEngine = (behavior: string, extra: readonly string[] = [], startupTimeoutMs = 10_000): RecipeEngine => ({
   name: "fake",
   args: [FAKE_ENGINE, "--port", "{port}", "--storage-dir", "{profileDir}", "--behavior", behavior, ...extra],
-  headlessOnly: true,
   startupTimeoutMs,
 });
 
@@ -93,7 +92,6 @@ describe("launchRecipeBrowser", () => {
     ]);
     expect(record.envKeys).not.toContain("CHROME_MCP_TEST_SECRET");
     expect(record.pid).toBe(handle.recipe.browserPid);
-    expect(handle.pageViewport).toBeUndefined();
   });
 
   test("fails at once with the exit code and stderr tail when the engine exits before it is ready", async () => {
@@ -132,15 +130,22 @@ describe("launchRecipeBrowser", () => {
     expect(handle.recipe.endpoint).toStartWith("ws://127.0.0.1:");
   });
 
-  test("lets an engine that exits on Browser.close stop on its own", async () => {
+  test("closes an engine that exited on Browser.close without signalling its freed PID", async () => {
     const handle = await launch(fakeEngine("ready"), join(root, "profile"));
     const connection = await CdpConnection.connect(handle.recipe.endpoint);
     await connection.send("Browser.close");
     connection.close();
 
-    await handle.close();
+    const kill = spyOn(process, "kill");
 
-    expect(await handle.recipe.exited).toBe(0);
+    try {
+      await handle.close();
+
+      expect(await handle.recipe.exited).toBe(0);
+      expect(kill.mock.calls.filter(([pid]) => pid === handle.recipe.browserPid)).toEqual([]);
+    } finally {
+      kill.mockRestore();
+    }
   });
 
   test("stops the process tree when the engine ignores Browser.close", async () => {

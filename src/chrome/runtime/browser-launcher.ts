@@ -14,12 +14,9 @@ import { assertNativeDeviceScaleFactor, isHeadlessMode } from "./modes";
 import { createPageViewportController, type PageViewportController } from "./page-viewport";
 import { launchVirtualDisplay } from "./virtual-display";
 
-export type RecipeProcessInfo = Readonly<{ browserPid: number; endpoint: string; exited: Promise<number> }>;
-
 export type LaunchedBrowserHandle = Readonly<{
   close: () => Promise<void>;
-  pageViewport?: PageViewportController;
-  recipe?: RecipeProcessInfo;
+  pageViewport: PageViewportController;
   sendPwaCommand?: PwaCommand;
 }>;
 

@@ -27,7 +27,11 @@ import { isSupportedBunVersion, MINIMUM_BUN_VERSION_TEXT } from "../bun-version"
 import { probeProcessIdentity } from "../runtime";
 import { MAIN_CHROME_CONNECT_TIMEOUT_MS } from "../runtime/browser-launcher";
 import type { LaunchedEngine, RecipeEngine } from "../runtime/engine-recipes";
-import { assertMatchingNativeDeviceScaleFactor, assertNativeDeviceScaleFactor } from "../runtime/modes";
+import {
+  assertMatchingNativeDeviceScaleFactor,
+  assertNativeDeviceScaleFactor,
+  isAttachedMode,
+} from "../runtime/modes";
 import { resolveBrokerChildProcess } from "./child-environment";
 import {
   BROKER_ADMISSION_RESPONSE_GRACE_MS,
@@ -73,6 +77,21 @@ export const brokerAdmissionRequestTimeoutMs = (deadlineAt: number | undefined, 
   deadlineAt === undefined ? BROKER_REQUEST_TIMEOUT_MS : (
     Math.max(BROKER_REQUEST_TIMEOUT_MS, deadlineAt - now + BROKER_ADMISSION_RESPONSE_GRACE_MS)
   );
+
+// When the client gives up first, the broker closes the session that arrives late and stops a launched engine, so
+// this budget must cover how long the broker may legitimately spend opening the browser.
+export const calculateSessionAcquireTimeoutMs = (mode: BrowserMode, engine: RecipeEngine | undefined) => {
+  if (mode === "main") {
+    return MAIN_CHROME_CONNECT_TIMEOUT_MS + BROKER_REQUEST_TIMEOUT_MS + BROKER_ADMISSION_RESPONSE_GRACE_MS;
+  }
+
+  const launchesRecipeEngine = engine !== undefined && !isAttachedMode(mode);
+  if (launchesRecipeEngine) {
+    return engine.startupTimeoutMs + BROKER_REQUEST_TIMEOUT_MS + BROKER_ADMISSION_RESPONSE_GRACE_MS;
+  }
+
+  return BROKER_REQUEST_TIMEOUT_MS;
+};
 
 type PendingRequest = Readonly<{
   reject: (error: Error) => void;
@@ -1514,10 +1533,7 @@ export const connectChromeBroker = async (
 
       nativeScales.set(mode, nativeDeviceScaleFactor);
       const acquisition = (async () => {
-        const timeoutMs =
-          mode === "main" ?
-            MAIN_CHROME_CONNECT_TIMEOUT_MS + BROKER_REQUEST_TIMEOUT_MS + BROKER_ADMISSION_RESPONSE_GRACE_MS
-          : BROKER_REQUEST_TIMEOUT_MS;
+        const timeoutMs = calculateSessionAcquireTimeoutMs(mode, options.engine);
         const mainUserDataDir = mode === "main" ? options.mainUserDataDir : undefined;
         const result = brokerResults.acquired.parse(
           await connected.connection.request(

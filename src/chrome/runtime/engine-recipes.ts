@@ -12,14 +12,12 @@ export const MAX_RECIPE_STARTUP_TIMEOUT_MS = 120_000;
 export type EngineRecipe = Readonly<{
   command?: string;
   args: readonly string[];
-  headlessOnly: boolean;
   startupTimeoutMs: number;
 }>;
 
 export type RecipeEngine = Readonly<{
   name: string;
   args: readonly string[];
-  headlessOnly: boolean;
   startupTimeoutMs: number;
 }>;
 
@@ -30,12 +28,10 @@ export type EngineSelection =
 export const BUILT_IN_ENGINE_RECIPES: Readonly<Record<"obscura" | "lightpanda", EngineRecipe>> = {
   obscura: {
     args: ["serve", "--port", "{port}", "--storage-dir", "{profileDir}", "--allow-private-network"],
-    headlessOnly: true,
     startupTimeoutMs: DEFAULT_RECIPE_STARTUP_TIMEOUT_MS,
   },
   lightpanda: {
     args: ["serve", "--host", "127.0.0.1", "--port", "{port}"],
-    headlessOnly: true,
     startupTimeoutMs: DEFAULT_RECIPE_STARTUP_TIMEOUT_MS,
   },
 };
@@ -44,7 +40,6 @@ export const recipeEngineSchema = z
   .object({
     name: z.string(),
     args: z.array(z.string()),
-    headlessOnly: z.boolean(),
     startupTimeoutMs: z.number(),
   })
   .strict();
@@ -57,7 +52,6 @@ const recipeFileEntrySchema = z
   .object({
     command: z.string().refine((command) => isAbsolute(command), "command must be an absolute path"),
     args: z.array(z.string()),
-    headlessOnly: z.boolean().default(true),
     startupTimeoutMs: z.number().int().min(1).max(MAX_RECIPE_STARTUP_TIMEOUT_MS).default(
       DEFAULT_RECIPE_STARTUP_TIMEOUT_MS,
     ),
@@ -167,18 +161,14 @@ export const expandRecipeArguments = (
     ),
   );
 
+// Recipes receive no mode, so an engine launches the same way for every mode: only the headless modes can keep
+// their promise of no visible window.
 export const assertEngineSupportsMode = (engine: RecipeEngine | undefined, mode: BrowserMode): void => {
-  if (!engine || isAttachedMode(mode)) return;
-  if (engine.headlessOnly && !isHeadlessMode(mode)) {
-    throw new ChromeRuntimeError(
-      "CHROME_MCP_ENGINE_UNSUPPORTED_MODE",
-      `The ${engine.name} engine runs headless only, so browser "${mode}" is unavailable. Use isolated-headless or shared-headless, or start the server without --engine to use Chrome.`,
-    );
-  }
-  if (mode === "isolated-virtual-display") {
-    throw new ChromeRuntimeError(
-      "CHROME_MCP_ENGINE_UNSUPPORTED_MODE",
-      `The ${engine.name} engine cannot run isolated-virtual-display, which needs Chrome. Use isolated-headless, shared-headless, isolated, or shared.`,
-    );
-  }
+  const isModeSupported = engine === undefined || isAttachedMode(mode) || isHeadlessMode(mode);
+  if (isModeSupported) return;
+
+  throw new ChromeRuntimeError(
+    "CHROME_MCP_ENGINE_UNSUPPORTED_MODE",
+    `The ${engine.name} engine runs headless only, so browser "${mode}" is unavailable. Use isolated-headless or shared-headless, or start the server without --engine to use Chrome.`,
+  );
 };
